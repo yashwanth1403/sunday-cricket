@@ -1,12 +1,32 @@
 import { MatchHistory } from "@/components/MatchHistory";
+import { prisma } from "@/lib/prisma";
+
+export const revalidate = 15; // Revalidate every 15 seconds
 
 async function getMatches() {
-  const base = process.env.NEXT_PUBLIC_BASE_URL ?? "http://localhost:3000";
-  const res = await fetch(new URL("/api/matches", base).toString(), {
-    next: { revalidate: 15 },
-  });
-  if (!res.ok) return [];
-  return res.json();
+  try {
+    const matchesData = await prisma.match.findMany({
+      orderBy: { date: "desc" },
+      take: 20,
+      include: {
+        manOfMatch: true,
+        innings: true,
+      },
+    });
+
+    return matchesData.map((m) => ({
+      id: m.id,
+      name: m.name,
+      date: m.date.toISOString(),
+      teamA: m.teamA,
+      teamB: m.teamB,
+      winner: m.winner,
+      manOfMatch: m.manOfMatch ? { name: m.manOfMatch.name } : null,
+    }));
+  } catch (error) {
+    console.error("Failed to load matches:", error);
+    return [];
+  }
 }
 
 export default async function MatchesPage() {

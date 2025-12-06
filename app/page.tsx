@@ -1,47 +1,43 @@
 import Link from "next/link";
 import { MatchHistory } from "@/components/MatchHistory";
 import { Leaderboard } from "@/components/Leaderboard";
+import { prisma } from "@/lib/prisma";
+
+export const revalidate = 10; // Revalidate every 10 seconds
 
 async function getHomeData() {
-  const base = process.env.NEXT_PUBLIC_BASE_URL ?? "http://localhost:3000";
-  const res = await fetch(new URL("/api/matches", base).toString(), {
-    next: { revalidate: 10 },
-  });
+  try {
+    const matchesData = await prisma.match.findMany({
+      orderBy: { date: "desc" },
+      take: 20,
+      include: {
+        manOfMatch: true,
+        innings: true,
+      },
+    });
 
-  if (!res.ok) {
+    const matches = matchesData.map((m) => ({
+      id: m.id,
+      name: m.name,
+      date: m.date.toISOString(),
+      teamA: m.teamA,
+      teamB: m.teamB,
+      winner: m.winner,
+      manOfMatchName: m.manOfMatch?.name ?? null,
+    }));
+
+    // Placeholder leaderboard derived from recent matches' player stats (can be
+    // replaced with dedicated /api/leaderboards later).
+    const topRuns: { playerId: string; name: string; value: number }[] = [];
+
+    return { matches, topRuns };
+  } catch (error) {
+    console.error("Failed to load home data:", error);
     return {
       matches: [],
       topRuns: [],
     };
   }
-
-  type MatchApi = {
-    id: string;
-    name: string;
-    date: string;
-    teamA: string;
-    teamB: string;
-    winner: "A" | "B" | null;
-    manOfMatch?: { name: string } | null;
-  };
-
-  const data: MatchApi[] = await res.json();
-
-  const matches = data.map((m) => ({
-    id: m.id,
-    name: m.name,
-    date: m.date,
-    teamA: m.teamA,
-    teamB: m.teamB,
-    winner: m.winner,
-    manOfMatchName: m.manOfMatch?.name ?? null,
-  }));
-
-  // Placeholder leaderboard derived from recent matches' player stats (can be
-  // replaced with dedicated /api/leaderboards later).
-  const topRuns: { playerId: string; name: string; value: number }[] = [];
-
-  return { matches, topRuns };
 }
 
 export default async function Home() {
@@ -92,7 +88,9 @@ export default async function Home() {
                 <div className="text-xs font-semibold uppercase tracking-wide text-white/90">
                   Previous Man of the Match
                 </div>
-                <div className="mt-1 text-xl font-bold">{latestMom.manOfMatchName}</div>
+                <div className="mt-1 text-xl font-bold">
+                  {latestMom.manOfMatchName}
+                </div>
                 <div className="text-sm text-white/90">
                   {latestMom.teamA} vs {latestMom.teamB} •{" "}
                   {new Date(latestMom.date).toLocaleDateString()}
