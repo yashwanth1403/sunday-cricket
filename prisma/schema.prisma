@@ -1,0 +1,201 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum TeamSide {
+  A
+  B
+}
+
+enum MatchStatus {
+  SCHEDULED
+  IN_PROGRESS
+  COMPLETED
+}
+
+enum InningsStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  COMPLETED
+}
+
+enum BadgeType {
+  FIFTY
+  BOUNDARY_BURST
+  HAT_TRICK
+  FIVE_FOR
+  SIXER_MONSTER_10
+  SIXER_MONSTER_25
+  SIXER_MONSTER_50
+  MOM_MASTER_1
+  MOM_MASTER_5
+  MOM_MASTER_10
+}
+
+enum WicketType {
+  BOWLED
+  CAUGHT
+  CAUGHT_AND_BOWLED
+  RUN_OUT
+  STUMPED
+  LBW
+  HIT_WICKET
+  RETIRED
+  OTHER
+}
+
+model Player {
+  id        String   @id @default(cuid())
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  matches         MatchPlayer[]
+  playerStats     PlayerMatchStats[]
+  badges          Badge[]
+  manOfMatchFor   Match[]            @relation("ManOfMatch")
+  ballsFaced      Ball[]             @relation("Batsman")
+  ballsNonStriker Ball[]             @relation("NonStriker")
+  ballsBowled     Ball[]             @relation("Bowler")
+  catches         Ball[]             @relation("Fielder")
+}
+
+model Match {
+  id                String      @id @default(cuid())
+  name              String
+  date              DateTime
+  teamA             String
+  teamB             String
+  totalOvers        Int
+  maxOversPerBowler Int
+  status            MatchStatus @default(SCHEDULED)
+  winner            TeamSide?
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+
+  players     MatchPlayer[]
+  innings     Innings[]
+  playerStats PlayerMatchStats[]
+  badges      Badge[]
+
+  manOfMatchId String?
+  manOfMatch   Player? @relation("ManOfMatch", fields: [manOfMatchId], references: [id])
+}
+
+model MatchPlayer {
+  id           String   @id @default(cuid())
+  matchId      String
+  playerId     String
+  team         TeamSide
+  isDualPlayer Boolean  @default(false)
+  battingOrder Int?
+  bowlingOrder Int?
+
+  match  Match  @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  player Player @relation(fields: [playerId], references: [id], onDelete: Cascade)
+
+  @@unique([matchId, playerId])
+}
+
+model Innings {
+  id            String        @id @default(cuid())
+  matchId       String
+  inningsNumber Int
+  battingTeam   TeamSide
+  bowlingTeam   TeamSide
+  totalRuns     Int           @default(0)
+  wickets       Int           @default(0)
+  overs         Int           @default(0)
+  ballsInOver   Int           @default(0)
+  status        InningsStatus @default(NOT_STARTED)
+  createdAt     DateTime      @default(now())
+
+  match       Match              @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  balls       Ball[]
+  playerStats PlayerMatchStats[]
+
+  @@unique([matchId, inningsNumber])
+}
+
+model Ball {
+  id                 String      @id @default(cuid())
+  inningsId          String
+  overNumber         Int
+  ballNumber         Int // counts legal balls within an over (1–6)
+  batsmanId          String
+  nonStrikerId       String
+  bowlerId           String
+  runs               Int         @default(0)
+  isWide             Boolean     @default(false)
+  isNoBall           Boolean     @default(false)
+  isWicket           Boolean     @default(false)
+  wicketType         WicketType?
+  fielderId          String? // For caught dismissals (CAUGHT, CAUGHT_AND_BOWLED)
+  dismissedBatsmanId String? // For run out - which batsman was dismissed (striker or non-striker)
+  strikerChanged     Boolean     @default(false)
+  createdAt          DateTime    @default(now())
+
+  innings    Innings @relation(fields: [inningsId], references: [id], onDelete: Cascade)
+  batsman    Player  @relation("Batsman", fields: [batsmanId], references: [id])
+  nonStriker Player  @relation("NonStriker", fields: [nonStrikerId], references: [id])
+  bowler     Player  @relation("Bowler", fields: [bowlerId], references: [id])
+  fielder    Player? @relation("Fielder", fields: [fielderId], references: [id])
+
+  @@index([inningsId, overNumber])
+}
+
+model PlayerMatchStats {
+  id        String @id @default(cuid())
+  matchId   String
+  inningsId String
+  playerId  String
+
+  // Batting
+  runs       Int @default(0)
+  ballsFaced Int @default(0)
+  fours      Int @default(0)
+  sixes      Int @default(0)
+
+  // Bowling
+  ballsBowled  Int @default(0)
+  runsConceded Int @default(0)
+  wickets      Int @default(0)
+  maidens      Int @default(0)
+  noBalls      Int @default(0)
+  wides        Int @default(0)
+
+  // Fielding
+  catches   Int @default(0)
+  stumpings Int @default(0)
+  runOuts   Int @default(0)
+
+  match   Match   @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  innings Innings @relation(fields: [inningsId], references: [id], onDelete: Cascade)
+  player  Player  @relation(fields: [playerId], references: [id], onDelete: Cascade)
+
+  @@unique([matchId, inningsId, playerId])
+}
+
+model Badge {
+  id         String    @id @default(cuid())
+  playerId   String
+  matchId    String?
+  type       BadgeType
+  unlockedAt DateTime  @default(now())
+
+  player Player @relation(fields: [playerId], references: [id], onDelete: Cascade)
+  match  Match? @relation(fields: [matchId], references: [id], onDelete: Cascade)
+}
+
+model BadgeDefinition {
+  id          String    @id @default(cuid())
+  type        BadgeType @unique
+  name        String
+  description String
+  icon        String
+}
