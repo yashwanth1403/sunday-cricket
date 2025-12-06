@@ -112,6 +112,58 @@ export function LiveScoring({
   const nonStriker = battingPlayers.find((p) => p.id === nonStrikerId);
   const bowler = bowlingPlayers.find((p) => p.id === bowlerId);
 
+  // Helper function to calculate optimistic score update
+  function calculateOptimisticScore(
+    currentScore: typeof score,
+    payload: {
+      runs: number;
+      isWide?: boolean;
+      isNoBall?: boolean;
+      isWicket?: boolean;
+    }
+  ) {
+    const isLegal = !payload.isWide && !payload.isNoBall;
+    let runsToAdd = payload.runs;
+
+    // Add extra run for wide/no-ball
+    if (payload.isWide || payload.isNoBall) {
+      runsToAdd += 1;
+    }
+
+    let newBallsInOver = currentScore.ballsInOver;
+    let newOvers = currentScore.overs;
+
+    // Only increment ball count for legal deliveries
+    if (isLegal) {
+      newBallsInOver += 1;
+      // Check if over is complete (6 legal balls)
+      if (newBallsInOver >= 6) {
+        newBallsInOver = 0;
+        newOvers += 1;
+      }
+    }
+
+    return {
+      totalRuns: currentScore.totalRuns + runsToAdd,
+      wickets: currentScore.wickets + (payload.isWicket ? 1 : 0),
+      overs: newOvers,
+      ballsInOver: newBallsInOver,
+    };
+  }
+
+  // Helper function to determine if strike should change
+  function shouldChangeStrike(
+    runs: number,
+    isWide?: boolean,
+    isNoBall?: boolean
+  ): boolean {
+    // Odd runs (1, 3) change strike
+    if (runs === 1 || runs === 3) return true;
+    // Wide and no-ball change strike
+    if (isWide || isNoBall) return true;
+    return false;
+  }
+
   async function sendBall(payload: {
     runs: number;
     isWide?: boolean;
@@ -125,10 +177,109 @@ export function LiveScoring({
       setError("Select striker, non-striker, and bowler before scoring");
       return;
     }
-    setLoading(true);
+
+    // Save current state for potential rollback
+    const prevState = {
+      score: { ...score },
+      balls: [...balls],
+      strikerId,
+      nonStrikerId,
+      bowlerId,
+    };
+
     setError(null);
+
+    // Calculate optimistic score update
+    const optimisticScore = calculateOptimisticScore(score, payload);
+
+    // Create optimistic ball object (temporary ID)
+    const tempBallId = `temp-${Date.now()}`;
+    const optimisticBall: BallLike = {
+      id: tempBallId,
+      overNumber: optimisticScore.overs,
+      ballNumber: 0, // Will be set by backend
+      runs: payload.runs,
+      isWide: payload.isWide ?? false,
+      isNoBall: payload.isNoBall ?? false,
+      isWicket: payload.isWicket ?? false,
+      batsmanId: striker.id,
+      bowlerId: bowler.id,
+      strikerChanged: shouldChangeStrike(
+        payload.runs,
+        payload.isWide,
+        payload.isNoBall
+      ),
+      wicketType: payload.wicketType,
+      fielderId: payload.fielderId,
+      dismissedBatsmanId: payload.dismissedBatsmanId,
+    };
+
+    // Optimistically update frontend state immediately
+    setScore(optimisticScore);
+    setBalls((prev) => [...prev, optimisticBall]);
+
+    // Handle optimistic player state changes
+    let newStrikerId = strikerId;
+    let newNonStrikerId = nonStrikerId;
+    let newBowlerId = bowlerId;
+
+    // Handle wicket dismissal optimistically
+    if (payload.isWicket) {
+      const dismissedId = payload.dismissedBatsmanId || striker.id;
+      const nextBatsman = battingPlayers.find(
+        (p) => p.id !== strikerId && p.id !== nonStrikerId
+      );
+
+      if (dismissedId === strikerId) {
+        if (nextBatsman) {
+          newStrikerId = nonStrikerId;
+          newNonStrikerId = nextBatsman.id;
+        } else {
+          newStrikerId = nonStrikerId;
+        }
+      } else if (dismissedId === nonStrikerId) {
+        if (nextBatsman) {
+          newNonStrikerId = nextBatsman.id;
+        }
+      } else {
+        if (nextBatsman) {
+          newStrikerId = nonStrikerId;
+          newNonStrikerId = nextBatsman.id;
+        } else {
+          newStrikerId = nonStrikerId;
+        }
+      }
+    }
+
+    // Handle strike rotation optimistically
+    const strikeChanged = shouldChangeStrike(
+      payload.runs,
+      payload.isWide,
+      payload.isNoBall
+    );
+    if (strikeChanged && !payload.isWicket && striker && nonStriker) {
+      newStrikerId = nonStriker.id;
+      newNonStrikerId = striker.id;
+    }
+
+    // Handle over completion optimistically
+    const overCompleted =
+      optimisticScore.overs > prevState.score.overs ||
+      (prevState.score.ballsInOver === 5 && optimisticScore.ballsInOver === 0);
+    if (overCompleted && striker && nonStriker) {
+      newStrikerId = nonStriker.id;
+      newNonStrikerId = striker.id;
+      newBowlerId = undefined;
+    }
+
+    // Apply optimistic player state changes
+    setStrikerId(newStrikerId);
+    setNonStrikerId(newNonStrikerId);
+    setBowlerId(newBowlerId);
+    setLoading(true);
+
+    // Now send backend request
     try {
-      const prevScore = score;
       const res = await fetch(
         `/api/matches/${matchId}/innings/${inningsId}/ball`,
         {
@@ -148,14 +299,17 @@ export function LiveScoring({
           }),
         }
       );
+
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.error ?? "Failed to record ball");
       }
+
       const data = await res.json();
       const ball = data.ball as BallLike & { strikerChanged?: boolean };
 
-      setBalls((prev) => [...prev, ball]);
+      // Replace optimistic ball with real ball from server
+      setBalls((prev) => prev.filter((b) => b.id !== tempBallId).concat(ball));
 
       // Check if innings can be completed (user must confirm)
       if (data.canCompleteInnings) {
@@ -170,69 +324,76 @@ export function LiveScoring({
         return;
       }
 
-      // Handle wicket dismissal - reset the dismissed batsman
-      if (ball.isWicket) {
-        const dismissedId = ball.dismissedBatsmanId || ball.batsmanId; // Use ball's dismissedBatsmanId or default to striker
-        const nextBatsman = battingPlayers.find(
-          (p) => p.id !== strikerId && p.id !== nonStrikerId
-        );
-
-        if (dismissedId === strikerId) {
-          // Striker was dismissed
-          if (nextBatsman) {
-            // Move non-striker to striker, new batsman to non-striker
-            setStrikerId(nonStrikerId);
-            setNonStrikerId(nextBatsman.id);
-          } else {
-            // No more batsmen, just swap positions
-            setStrikerId(nonStrikerId);
-          }
-        } else if (dismissedId === nonStrikerId) {
-          // Non-striker was dismissed, replace with next batsman
-          if (nextBatsman) {
-            setNonStrikerId(nextBatsman.id);
-          }
-        } else {
-          // Fallback: striker is dismissed (shouldn't happen, but just in case)
-          if (nextBatsman) {
-            setStrikerId(nonStrikerId);
-            setNonStrikerId(nextBatsman.id);
-          } else {
-            setStrikerId(nonStrikerId);
-          }
-        }
-      }
-
-      // Per-ball strike rotation: odd runs (1, 3) and extras (wide, no-ball) change strike
-      // The backend calculates strikerChanged based on runs and extras
-      if (ball.strikerChanged && striker && nonStriker && !ball.isWicket) {
-        // Swap striker and non-striker for odd runs or extras (but not after wicket)
-        setStrikerId(nonStriker.id);
-        setNonStrikerId(striker.id);
-      }
-
-      const overCompleted =
-        data.innings.overs > prevScore.overs ||
-        (prevScore.ballsInOver === 5 &&
-          data.innings.ballsInOver === 0 &&
-          data.innings.overs === prevScore.overs + 1);
-
-      // End-of-over rotation: swap striker and non-striker after 6 legal balls
-      if (overCompleted && striker && nonStriker) {
-        // Rotate strike at end of over (six legal balls)
-        setStrikerId(nonStriker.id);
-        setNonStrikerId(striker.id);
-        // Reset bowler for next over
-        setBowlerId(undefined);
-      }
-
+      // Update score with server response (ensures sync)
       setScore({
         totalRuns: data.innings.totalRuns,
         wickets: data.innings.wickets,
         overs: data.innings.overs,
         ballsInOver: data.innings.ballsInOver,
       });
+
+      // Handle wicket dismissal with server data
+      if (ball.isWicket) {
+        const dismissedId = ball.dismissedBatsmanId || ball.batsmanId;
+        const nextBatsman = battingPlayers.find(
+          (p) => p.id !== newStrikerId && p.id !== newNonStrikerId
+        );
+
+        if (dismissedId === newStrikerId) {
+          if (nextBatsman) {
+            setStrikerId(newNonStrikerId);
+            setNonStrikerId(nextBatsman.id);
+          } else {
+            setStrikerId(newNonStrikerId);
+          }
+        } else if (dismissedId === newNonStrikerId) {
+          if (nextBatsman) {
+            setNonStrikerId(nextBatsman.id);
+          }
+        }
+      }
+
+      // Handle strike rotation with server data
+      if (ball.strikerChanged && !ball.isWicket) {
+        const currentStriker = battingPlayers.find(
+          (p) => p.id === newStrikerId
+        );
+        const currentNonStriker = battingPlayers.find(
+          (p) => p.id === newNonStrikerId
+        );
+        if (currentStriker && currentNonStriker) {
+          setStrikerId(currentNonStriker.id);
+          setNonStrikerId(currentStriker.id);
+        }
+      }
+
+      // Handle over completion with server data
+      const serverOverCompleted =
+        data.innings.overs > prevState.score.overs ||
+        (prevState.score.ballsInOver === 5 &&
+          data.innings.ballsInOver === 0 &&
+          data.innings.overs === prevState.score.overs + 1);
+
+      if (serverOverCompleted) {
+        const currentStriker = battingPlayers.find(
+          (p) => p.id === newStrikerId
+        );
+        const currentNonStriker = battingPlayers.find(
+          (p) => p.id === newNonStrikerId
+        );
+        if (currentStriker && currentNonStriker) {
+          setStrikerId(currentNonStriker.id);
+          setNonStrikerId(currentStriker.id);
+          setBowlerId(undefined);
+        }
+      }
     } catch (err: unknown) {
+      // Revert to previous state on error
+      setScore(prevState.score);
+      setBalls(prevState.balls);
+      setStrikerId(prevState.strikerId);
+      setNonStrikerId(prevState.nonStrikerId);
+      setBowlerId(prevState.bowlerId);
       setError(err instanceof Error ? err.message : "Failed to record ball");
     } finally {
       setLoading(false);
@@ -475,43 +636,6 @@ export function LiveScoring({
             </div>
           </div>
 
-          {/* Current Players Info */}
-          <div className="grid grid-cols-2 gap-2 rounded-xl bg-white/15 p-3 backdrop-blur-sm">
-            <div className="text-xs">
-              <div className="text-blue-200">👤 Striker</div>
-              <div className="mt-0.5 font-bold">{striker?.name ?? "-"}</div>
-              {strikerStats && (
-                <div className="text-[10px] text-blue-100">
-                  {strikerStats.runs}({strikerStats.ballsFaced})
-                  {strikerStats.fours > 0 && ` • ${strikerStats.fours}×4`}
-                  {strikerStats.sixes > 0 && ` • ${strikerStats.sixes}×6`}
-                </div>
-              )}
-            </div>
-            <div className="text-xs">
-              <div className="text-blue-200">👤 Non-Striker</div>
-              <div className="mt-0.5 font-bold">{nonStriker?.name ?? "-"}</div>
-              {nonStrikerStats && (
-                <div className="text-[10px] text-blue-100">
-                  {nonStrikerStats.runs}({nonStrikerStats.ballsFaced})
-                </div>
-              )}
-            </div>
-            <div className="col-span-2 text-xs">
-              <div className="text-blue-200">🎾 Bowler</div>
-              <div className="mt-0.5 font-bold">
-                {bowler?.name ?? "-"} ({bowlingTeamName})
-              </div>
-              {bowlerStatsEntry && (
-                <div className="text-[10px] text-blue-100">
-                  {bowlerStatsEntry.wickets}/{bowlerStatsEntry.runsConceded} (
-                  {Math.floor(bowlerStatsEntry.ballsBowled / 6)}.
-                  {bowlerStatsEntry.ballsBowled % 6})
-                </div>
-              )}
-            </div>
-          </div>
-
           {/* Action Buttons */}
           <div className="flex gap-2">
             <button
@@ -614,15 +738,6 @@ export function LiveScoring({
           </div>
         </div>
 
-        <BallInputButtons
-          onBall={sendBall}
-          onUndo={undo}
-          striker={striker}
-          nonStriker={nonStriker}
-          bowler={bowler}
-          bowlingTeamPlayers={bowlingPlayers}
-        />
-
         {/* Status Messages */}
         {loading && (
           <div className="flex items-center justify-center gap-2 rounded-xl bg-blue-50 p-3">
@@ -673,6 +788,14 @@ export function LiveScoring({
             </div>
           </div>
         )}
+        <BallInputButtons
+          onBall={sendBall}
+          onUndo={undo}
+          striker={striker}
+          nonStriker={nonStriker}
+          bowler={bowler}
+          bowlingTeamPlayers={bowlingPlayers}
+        />
 
         <LiveStatsPanel
           striker={strikerStats}
