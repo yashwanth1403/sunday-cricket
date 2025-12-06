@@ -47,6 +47,7 @@ export async function recordBall(
     : legalBallsInCurrentOver;
 
   const changeStrike = shouldChangeStrike({
+    ballNumber: ballNumber,
     runs: input.runs,
     isWide: input.isWide,
     isNoBall: input.isNoBall,
