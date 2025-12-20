@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { recordBall, undoLastBall } from "@/lib/scoring/scoringEngine";
+import { recordBall, undoLastBall, syncRecordBallToDatabase, syncUndoBallToDatabase } from "@/lib/scoring/scoringEngine";
+import { calculateRecordBall, calculateUndoBall, type BallLike } from "@/lib/scoring/scoringCalculator";
 
 interface RouteProps {
   params: Promise<{
@@ -46,8 +47,33 @@ export async function POST(req: NextRequest, { params }: RouteProps) {
       return NextResponse.json({ error: "Innings not found" }, { status: 404 });
     }
 
-    const { innings: updatedInnings, ball } = await recordBall(inningsId, {
-      match,
+    // Get existing balls for calculation (fast read operation)
+    const existingBalls = await prisma.ball.findMany({
+      where: { inningsId },
+      orderBy: [{ overNumber: "asc" }, { ballNumber: "asc" }],
+    });
+
+    // Convert to BallLike format
+    const existingBallsLike: BallLike[] = existingBalls.map((b) => ({
+      id: b.id,
+      overNumber: b.overNumber,
+      ballNumber: b.ballNumber,
+      runs: b.runs,
+      isWide: b.isWide,
+      isNoBall: b.isNoBall,
+      isWicket: b.isWicket,
+      batsmanId: b.batsmanId,
+      nonStrikerId: b.nonStrikerId,
+      bowlerId: b.bowlerId,
+      strikerChanged: b.strikerChanged,
+      wicketType: b.wicketType,
+      fielderId: b.fielderId,
+      dismissedBatsmanId: b.dismissedBatsmanId,
+    }));
+
+    // Calculate immediately (pure function, no database access)
+    const calculationResult = calculateRecordBall({
+      existingBalls: existingBallsLike,
       innings,
       batsmanId,
       nonStrikerId,
@@ -60,6 +86,41 @@ export async function POST(req: NextRequest, { params }: RouteProps) {
       fielderId: fielderId || undefined,
       dismissedBatsmanId: dismissedBatsmanId || undefined,
     });
+
+    // Generate a temporary ID for the ball (will be replaced by database)
+    const tempBallId = `temp-${Date.now()}-${Math.random()}`;
+    const ballWithId: BallLike = {
+      ...calculationResult.ball,
+      id: tempBallId,
+    };
+
+    // Start background database sync (don't await - fire and forget)
+    syncRecordBallToDatabase(inningsId, {
+      match,
+      innings,
+      batsmanId,
+      nonStrikerId,
+      bowlerId,
+      runs: Number(runs ?? 0),
+      isWide: Boolean(isWide),
+      isNoBall: Boolean(isNoBall),
+      isWicket: Boolean(isWicket),
+      wicketType,
+      fielderId: fielderId || undefined,
+      dismissedBatsmanId: dismissedBatsmanId || undefined,
+    }, calculationResult).catch((error) => {
+      console.error("Background sync error:", error);
+      // In production, you might want to queue this for retry
+    });
+
+    // Use calculated result for immediate response
+    const updatedInnings = {
+      ...innings,
+      totalRuns: calculationResult.updatedInnings.totalRuns,
+      wickets: calculationResult.updatedInnings.wickets,
+      overs: calculationResult.updatedInnings.overs,
+      ballsInOver: calculationResult.updatedInnings.ballsInOver,
+    };
 
     // Get all match players to calculate actual batting team size
     const matchPlayers = await prisma.matchPlayer.findMany({
@@ -103,12 +164,13 @@ export async function POST(req: NextRequest, { params }: RouteProps) {
     return NextResponse.json(
       {
         innings: updatedInnings,
-        ball,
+        ball: ballWithId,
         canCompleteInnings,
         isAllOut,
         isOversComplete,
         isTargetReached,
         inningsNumber: updatedInnings.inningsNumber,
+        syncing: true, // Flag to indicate background sync is in progress
       },
       { status: 201 }
     );
@@ -125,8 +187,58 @@ export async function DELETE(_req: NextRequest, { params }: RouteProps) {
   const { inningsId } = await params;
 
   try {
-    const { innings, deletedBall } = await undoLastBall(inningsId);
-    return NextResponse.json({ innings, deletedBall });
+    // Get current innings
+    const innings = await prisma.innings.findUniqueOrThrow({
+      where: { id: inningsId },
+    });
+
+    // Get existing balls
+    const existingBalls = await prisma.ball.findMany({
+      where: { inningsId },
+      orderBy: [{ overNumber: "asc" }, { ballNumber: "asc" }],
+    });
+
+    // Convert to BallLike format
+    const existingBallsLike: BallLike[] = existingBalls.map((b) => ({
+      id: b.id,
+      overNumber: b.overNumber,
+      ballNumber: b.ballNumber,
+      runs: b.runs,
+      isWide: b.isWide,
+      isNoBall: b.isNoBall,
+      isWicket: b.isWicket,
+      batsmanId: b.batsmanId,
+      nonStrikerId: b.nonStrikerId,
+      bowlerId: b.bowlerId,
+      strikerChanged: b.strikerChanged,
+      wicketType: b.wicketType,
+      fielderId: b.fielderId,
+      dismissedBatsmanId: b.dismissedBatsmanId,
+    }));
+
+    // Calculate immediately
+    const calculationResult = calculateUndoBall({
+      existingBalls: existingBallsLike,
+      innings,
+    });
+
+    // Start background database sync
+    syncUndoBallToDatabase(inningsId, calculationResult).catch((error) => {
+      console.error("Background sync error (undo):", error);
+    });
+
+    // Return calculated result immediately
+    return NextResponse.json({
+      innings: {
+        ...innings,
+        totalRuns: calculationResult.updatedInnings.totalRuns,
+        wickets: calculationResult.updatedInnings.wickets,
+        overs: calculationResult.updatedInnings.overs,
+        ballsInOver: calculationResult.updatedInnings.ballsInOver,
+      },
+      deletedBall: calculationResult.deletedBall,
+      syncing: true,
+    });
   } catch (error) {
     console.error(error);
     return NextResponse.json(

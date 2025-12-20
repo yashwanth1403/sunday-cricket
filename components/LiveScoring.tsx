@@ -7,6 +7,10 @@ import { OverTimeline } from "./OverTimeline";
 import { LiveStatsPanel } from "./LiveStatsPanel";
 import { MatchScorecard } from "./MatchScorecard";
 import { InningsCompleteModal } from "./InningsCompleteModal";
+import {
+  calculateRecordBallClient,
+  calculateUndoBallClient,
+} from "@/lib/scoring/clientCalculator";
 
 type Player = {
   id: string;
@@ -15,8 +19,10 @@ type Player = {
   isDualPlayer?: boolean;
 };
 
+import type { Ball } from "@prisma/client";
+
 type BallLike = {
-  id: string;
+  id?: string;
   overNumber: number;
   ballNumber: number;
   runs: number;
@@ -24,9 +30,10 @@ type BallLike = {
   isNoBall: boolean;
   isWicket: boolean;
   batsmanId: string;
+  nonStrikerId: string;
   bowlerId: string;
   strikerChanged?: boolean;
-  wicketType?: string;
+  wicketType?: Ball["wicketType"] | null;
   fielderId?: string | null;
   dismissedBatsmanId?: string | null;
 };
@@ -68,7 +75,8 @@ export function LiveScoring({
   const [balls, setBalls] = useState<BallLike[]>(initialBalls);
   const [score, setScore] = useState(initialScore);
   const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [syncError, setSyncError] = useState<string | null>(null);
   const [showExitConfirm, setShowExitConfirm] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [showScorecard, setShowScorecard] = useState(false);
@@ -125,10 +133,171 @@ export function LiveScoring({
       setError("Select striker, non-striker, and bowler before scoring");
       return;
     }
-    setLoading(true);
     setError(null);
+    setSyncError(null);
+
+    // Store previous state for rollback if needed
+    const prevBalls = [...balls];
+    const prevScore = { ...score };
+    const prevStrikerId = strikerId;
+    const prevNonStrikerId = nonStrikerId;
+    const prevBowlerId = bowlerId;
+
     try {
-      const prevScore = score;
+      // Calculate immediately on client side (optimistic update)
+      const calculation = calculateRecordBallClient(
+        balls,
+        score,
+        striker.id,
+        nonStriker.id,
+        bowler.id,
+        {
+          runs: payload.runs ?? 0,
+          isWide: payload.isWide ?? false,
+          isNoBall: payload.isNoBall ?? false,
+          isWicket: payload.isWicket ?? false,
+          wicketType: (payload.wicketType as Ball["wicketType"]) ?? null,
+          fielderId: payload.fielderId ?? null,
+          dismissedBatsmanId: payload.dismissedBatsmanId ?? null,
+        }
+      );
+
+      // Generate temporary ID for the ball
+      const tempBallId = `temp-${Date.now()}-${Math.random()}`;
+      const ballWithId: BallLike = {
+        ...calculation.ball,
+        id: tempBallId,
+        wicketType: (calculation.ball.wicketType as Ball["wicketType"]) ?? null,
+      };
+
+      // Update state IMMEDIATELY (optimistic update)
+      setBalls((prev) => [...prev, ballWithId]);
+      setScore(calculation.updatedScore);
+
+      // Handle all edge cases for strike rotation and wickets
+      let newStrikerId = prevStrikerId;
+      let newNonStrikerId = prevNonStrikerId;
+      let newBowlerId = prevBowlerId;
+
+      // Handle wicket dismissal first (before strike rotation)
+      if (calculation.ball.isWicket) {
+        const dismissedId =
+          calculation.ball.dismissedBatsmanId || calculation.ball.batsmanId;
+
+        // Get all available batsmen (not currently at crease and not dismissed)
+        const dismissedBatsmen = new Set(
+          balls
+            .filter((b) => b.isWicket && b.dismissedBatsmanId)
+            .map((b) => b.dismissedBatsmanId!)
+        );
+        dismissedBatsmen.add(dismissedId);
+
+        const availableBatsmen = battingPlayers.filter(
+          (p) =>
+            p.id !== prevStrikerId &&
+            p.id !== prevNonStrikerId &&
+            !dismissedBatsmen.has(p.id)
+        );
+        const nextBatsman = availableBatsmen[0];
+
+        if (dismissedId === prevStrikerId) {
+          // Striker was dismissed
+          if (nextBatsman) {
+            // Non-striker moves to striker, new batsman to non-striker
+            newStrikerId = prevNonStrikerId;
+            newNonStrikerId = nextBatsman.id;
+          } else {
+            // No more batsmen - just swap positions
+            newStrikerId = prevNonStrikerId;
+            newNonStrikerId = undefined;
+          }
+        } else if (dismissedId === prevNonStrikerId) {
+          // Non-striker was dismissed
+          if (nextBatsman) {
+            // Striker stays, new batsman to non-striker
+            newNonStrikerId = nextBatsman.id;
+          } else {
+            // No more batsmen
+            newNonStrikerId = undefined;
+          }
+        }
+      } else {
+        // No wicket - handle strike rotation
+        // On the 6th ball: if odd runs, apply BOTH swaps (odd run + over completion)
+        // This results in net no change (two swaps = back to original)
+        // On the 6th ball: if even runs, only apply over completion swap
+
+        const is6thBall = calculation.ball.ballNumber === 6;
+        const isOddRun = (payload.runs ?? 0) % 2 === 1;
+        const isLegalBall = !payload.isWide && !payload.isNoBall;
+
+        // First, apply per-ball strike rotation if needed
+        // For balls 1-5: apply if odd runs (calculation.strikerChanged handles this)
+        // For ball 6: apply if odd runs (even though shouldChangeStrike returns false)
+        if (prevStrikerId && prevNonStrikerId) {
+          if (is6thBall && isOddRun && isLegalBall) {
+            // 6th ball with odd runs: apply first swap (for the odd run)
+            newStrikerId = prevNonStrikerId;
+            newNonStrikerId = prevStrikerId;
+          } else if (calculation.strikerChanged && !is6thBall) {
+            // Balls 1-5: apply swap if odd runs
+            newStrikerId = prevNonStrikerId;
+            newNonStrikerId = prevStrikerId;
+          }
+        }
+
+        // Then, apply over completion swap (always happens on 6th ball)
+        // Use CURRENT positions (after first swap if it happened) for the second swap
+        if (calculation.overCompleted && newStrikerId && newNonStrikerId) {
+          // Over completed - swap positions again (this happens regardless of runs)
+          // If odd run on 6th ball: this is the second swap, canceling the first
+          // If even run on 6th ball: this is the only swap
+          const currentStriker = newStrikerId;
+          const currentNonStriker = newNonStrikerId;
+          newStrikerId = currentNonStriker;
+          newNonStrikerId = currentStriker;
+          newBowlerId = undefined; // Require new bowler selection
+        } else if (
+          calculation.overCompleted &&
+          prevStrikerId &&
+          prevNonStrikerId
+        ) {
+          // Fallback: if no first swap happened, use previous positions
+          newStrikerId = prevNonStrikerId;
+          newNonStrikerId = prevStrikerId;
+          newBowlerId = undefined; // Require new bowler selection
+        }
+      }
+
+      // Apply all state changes
+      setStrikerId(newStrikerId);
+      setNonStrikerId(newNonStrikerId);
+      if (newBowlerId !== prevBowlerId) {
+        setBowlerId(newBowlerId);
+      }
+
+      // Check if innings can be completed
+      const maxWickets = Math.max(0, battingPlayers.length - 1);
+      const isAllOut = calculation.updatedScore.wickets >= maxWickets;
+      const isOversComplete = calculation.updatedScore.overs >= totalOvers;
+      let isTargetReached = false;
+      if (inningsNumber === 2 && targetRuns !== null) {
+        isTargetReached = calculation.updatedScore.totalRuns >= targetRuns;
+      }
+      const isInningsComplete = isOversComplete || isAllOut || isTargetReached;
+
+      if (isInningsComplete) {
+        setInningsCompleteData({
+          isAllOut,
+          isOversComplete,
+          isTargetReached,
+          inningsNumber,
+        });
+        setShowInningsCompleteModal(true);
+      }
+
+      // Start background database sync (don't block UI)
+      setSyncing(true);
       const res = await fetch(
         `/api/matches/${matchId}/innings/${inningsId}/ball`,
         {
@@ -148,146 +317,197 @@ export function LiveScoring({
           }),
         }
       );
+
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.error ?? "Failed to record ball");
       }
+
       const data = await res.json();
-      const ball = data.ball as BallLike & { strikerChanged?: boolean };
-      console.log("ball", ball);
-      setBalls((prev) => [...prev, ball]);
+      const serverBall = data.ball as BallLike;
 
-      // Check if innings can be completed (user must confirm)
-      if (data.canCompleteInnings) {
-        setInningsCompleteData({
-          isAllOut: data.isAllOut,
-          isOversComplete: data.isOversComplete,
-          isTargetReached: data.isTargetReached,
-          inningsNumber: data.inningsNumber,
-        });
-        setShowInningsCompleteModal(true);
-        setLoading(false);
-        return;
-      }
-
-      // Handle wicket dismissal - reset the dismissed batsman
-      if (ball.isWicket) {
-        const dismissedId = ball.dismissedBatsmanId || ball.batsmanId; // Use ball's dismissedBatsmanId or default to striker
-        const nextBatsman = battingPlayers.find(
-          (p) => p.id !== strikerId && p.id !== nonStrikerId
-        );
-
-        if (dismissedId === strikerId) {
-          // Striker was dismissed
-          if (nextBatsman) {
-            // Move non-striker to striker, new batsman to non-striker
-            setStrikerId(nonStrikerId);
-            setNonStrikerId(nextBatsman.id);
-          } else {
-            // No more batsmen, just swap positions
-            setStrikerId(nonStrikerId);
-          }
-        } else if (dismissedId === nonStrikerId) {
-          // Non-striker was dismissed, replace with next batsman
-          if (nextBatsman) {
-            setNonStrikerId(nextBatsman.id);
-          }
-        } else {
-          // Fallback: striker is dismissed (shouldn't happen, but just in case)
-          if (nextBatsman) {
-            setStrikerId(nonStrikerId);
-            setNonStrikerId(nextBatsman.id);
-          } else {
-            setStrikerId(nonStrikerId);
-          }
+      // Replace temporary ball with server ball (update ID)
+      setBalls((prev) => {
+        const updated = [...prev];
+        const tempIndex = updated.findIndex((b) => b.id === tempBallId);
+        if (tempIndex !== -1) {
+          updated[tempIndex] = {
+            ...serverBall,
+            id: serverBall.id || tempBallId,
+            wicketType: serverBall.wicketType ?? null,
+          };
         }
-      }
+        return updated;
+      });
 
-      // Per-ball strike rotation: odd runs (1, 3) and extras (wide, no-ball) change strike
-      // The backend calculates strikerChanged based on runs and extras
-      if (ball.strikerChanged && striker && nonStriker && !ball.isWicket) {
-        // Swap striker and non-striker for odd runs or extras (but not after wicket)
-        setStrikerId(nonStriker.id);
-        setNonStrikerId(striker.id);
-      }
-
-      const overCompleted =
-        data.innings.overs > prevScore.overs ||
-        (prevScore.ballsInOver === 5 &&
-          data.innings.ballsInOver === 0 &&
-          data.innings.overs === prevScore.overs + 1);
-
-      // End-of-over rotation: swap striker and non-striker after 6 legal balls
-      if (overCompleted) {
-        setBowlerId(undefined);
-      }
-
+      // Update score with server response (in case of any discrepancies)
       setScore({
         totalRuns: data.innings.totalRuns,
         wickets: data.innings.wickets,
         overs: data.innings.overs,
         ballsInOver: data.innings.ballsInOver,
       });
+
+      // Clear syncing after a short delay
+      setTimeout(() => {
+        setSyncing(false);
+      }, 1000);
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to record ball");
-    } finally {
-      setLoading(false);
+      // Rollback on error
+      setBalls(prevBalls);
+      setScore(prevScore);
+      setStrikerId(prevStrikerId);
+      setNonStrikerId(prevNonStrikerId);
+      setBowlerId(prevBowlerId);
+      const errorMessage =
+        err instanceof Error ? err.message : "Failed to record ball";
+      setError(errorMessage);
+      setSyncError(errorMessage);
+      setSyncing(false);
     }
   }
 
   async function undo() {
-    setLoading(true);
+    if (balls.length === 0) {
+      setError("No balls to undo");
+      return;
+    }
+
     setError(null);
+    setSyncError(null);
+
+    // Store previous state for rollback if needed
+    const prevBalls = [...balls];
+    const prevScore = { ...score };
+    const prevStrikerId = strikerId;
+    const prevNonStrikerId = nonStrikerId;
+    const prevBowlerId = bowlerId;
+    const lastBall = prevBalls[prevBalls.length - 1];
+
+    if (!lastBall) {
+      return;
+    }
+
     try {
-      const prevScore = score;
+      // Calculate undo immediately on client side (optimistic update)
+      const calculation = calculateUndoBallClient(balls, score);
+
+      // Update state IMMEDIATELY (optimistic update)
+      setBalls(calculation.remainingBalls);
+      setScore(calculation.updatedScore);
+
+      // Handle undo of strike rotation and over completion
+      let newStrikerId = prevStrikerId;
+      let newNonStrikerId = prevNonStrikerId;
+      let newBowlerId = prevBowlerId;
+
+      // Check if an over was undone (over completion was reversed)
+      const overWasUndone =
+        calculation.updatedScore.overs < prevScore.overs ||
+        (prevScore.ballsInOver === 0 &&
+          calculation.updatedScore.ballsInOver === 5 &&
+          calculation.updatedScore.overs === prevScore.overs - 1);
+
+      // If the deleted ball changed strike, undo the strike change
+      if (
+        lastBall.strikerChanged &&
+        prevStrikerId &&
+        prevNonStrikerId &&
+        lastBall.ballNumber !== 6
+      ) {
+        // Swap back: if we swapped striker/non-striker, swap them back
+        newStrikerId = prevNonStrikerId;
+        newNonStrikerId = prevStrikerId;
+      }
+
+      // If an over was undone, undo the over completion strike swap
+      if (overWasUndone && prevStrikerId && prevNonStrikerId) {
+        // Swap back the over completion swap
+        newStrikerId = prevNonStrikerId;
+        newNonStrikerId = prevStrikerId;
+        // Restore bowler if over was undone
+        // We need to find the bowler from the previous over
+        const previousOverBalls = prevBalls.filter(
+          (b) => b.overNumber === calculation.updatedScore.overs
+        );
+        if (previousOverBalls.length > 0) {
+          const lastBallOfPreviousOver =
+            previousOverBalls[previousOverBalls.length - 1];
+          newBowlerId = lastBallOfPreviousOver.bowlerId;
+        }
+      }
+
+      // Handle wicket undo - restore dismissed batsman if needed
+      if (lastBall.isWicket) {
+        const dismissedId = lastBall.dismissedBatsmanId || lastBall.batsmanId;
+
+        if (dismissedId === prevStrikerId) {
+          // Striker was dismissed - restore them
+          newStrikerId = dismissedId;
+          // If non-striker was moved to striker, restore previous non-striker
+          if (prevNonStrikerId && prevNonStrikerId !== dismissedId) {
+            newNonStrikerId = prevNonStrikerId;
+          }
+        } else if (dismissedId === prevNonStrikerId) {
+          // Non-striker was dismissed - restore them
+          newNonStrikerId = dismissedId;
+        }
+      }
+
+      setStrikerId(newStrikerId);
+      setNonStrikerId(newNonStrikerId);
+      if (newBowlerId !== prevBowlerId) {
+        setBowlerId(newBowlerId);
+      }
+
+      // Start background database sync (don't block UI)
+      setSyncing(true);
       const res = await fetch(
         `/api/matches/${matchId}/innings/${inningsId}/ball`,
         { method: "DELETE" }
       );
+
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.error ?? "Failed to undo ball");
       }
+
       const data = await res.json();
+
+      // Update with server response (in case of any discrepancies)
       if (data.deletedBall) {
-        const deletedBall = data.deletedBall as BallLike & {
-          strikerChanged?: boolean;
-        };
-
-        // Check if an over was undone (over completion was reversed)
-        const overWasUndone =
-          data.innings.overs < prevScore.overs ||
-          (prevScore.ballsInOver === 0 &&
-            data.innings.ballsInOver === 5 &&
-            data.innings.overs === prevScore.overs - 1);
-
-        // If the deleted ball changed strike, undo the strike change
-        if (deletedBall.strikerChanged && striker && nonStriker) {
-          // Swap back: if we swapped striker/non-striker, swap them back
-          setStrikerId(nonStriker.id);
-          setNonStrikerId(striker.id);
-        }
-
-        // If an over was undone, undo the over completion strike swap
-        if (overWasUndone && striker && nonStriker) {
-          // Swap back the over completion swap
-          setStrikerId(nonStriker.id);
-          setNonStrikerId(striker.id);
-        }
-
-        // Remove the ball from the list
-        setBalls((prev) => prev.filter((b) => b.id !== deletedBall.id));
+        setBalls((prev) => {
+          const deletedId = data.deletedBall.id;
+          if (deletedId) {
+            return prev.filter((b) => b.id !== deletedId);
+          }
+          return prev.slice(0, -1);
+        });
       }
+
       setScore({
         totalRuns: data.innings.totalRuns,
         wickets: data.innings.wickets,
         overs: data.innings.overs,
         ballsInOver: data.innings.ballsInOver,
       });
+
+      // Clear syncing after a short delay
+      setTimeout(() => {
+        setSyncing(false);
+      }, 1000);
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to undo ball");
-    } finally {
-      setLoading(false);
+      // Rollback on error
+      setBalls(prevBalls);
+      setScore(prevScore);
+      setStrikerId(prevStrikerId);
+      setNonStrikerId(prevNonStrikerId);
+      setBowlerId(prevBowlerId);
+      const errorMessage =
+        err instanceof Error ? err.message : "Failed to undo ball";
+      setError(errorMessage);
+      setSyncError(errorMessage);
+      setSyncing(false);
     }
   }
 
@@ -370,10 +590,14 @@ export function LiveScoring({
     ballsBowled: number;
     runsConceded: number;
     wickets: number;
+    maidens: number;
+    wides: number;
+    noBalls: number;
   };
 
   const batterStats = new Map<string, BatterAgg>();
   const bowlerStats = new Map<string, BowlerAgg>();
+  const bowlerOverRuns = new Map<string, Map<number, number>>();
 
   for (const b of balls) {
     const bat = battingPlayers.find(
@@ -410,16 +634,56 @@ export function LiveScoring({
           ballsBowled: 0,
           runsConceded: 0,
           wickets: 0,
+          maidens: 0,
+          wides: 0,
+          noBalls: 0,
         });
+        bowlerOverRuns.set(bowlPlayer.id, new Map());
       }
       const bs = bowlerStats.get(bowlPlayer.id)!;
-      if (!b.isWide && !b.isNoBall) bs.ballsBowled += 1;
+      const isLegal = !b.isWide && !b.isNoBall;
+      if (isLegal) bs.ballsBowled += 1;
+
       let runsThisBall = b.runs;
-      if (b.isWide || b.isNoBall) {
+      if (b.isWide) {
         runsThisBall += 1;
+        bs.wides += 1;
+      }
+      if (b.isNoBall) {
+        runsThisBall += 1;
+        bs.noBalls += 1;
       }
       bs.runsConceded += runsThisBall;
-      if (b.isWicket) bs.wickets += 1;
+
+      // Track wickets (only credit bowler for certain dismissal types)
+      if (b.isWicket) {
+        const bowlerGetsWicket =
+          b.wicketType === "BOWLED" ||
+          b.wicketType === "CAUGHT" ||
+          b.wicketType === "CAUGHT_AND_BOWLED" ||
+          b.wicketType === "STUMPED" ||
+          b.wicketType === "HIT_WICKET";
+        if (bowlerGetsWicket) {
+          bs.wickets += 1;
+        }
+      }
+
+      // Track runs per over for maidens
+      const overMap = bowlerOverRuns.get(bowlPlayer.id)!;
+      overMap.set(
+        b.overNumber,
+        (overMap.get(b.overNumber) ?? 0) + runsThisBall
+      );
+    }
+  }
+
+  // Calculate maidens
+  for (const [playerId, overMap] of bowlerOverRuns.entries()) {
+    const stats = bowlerStats.get(playerId);
+    if (stats) {
+      for (const runs of overMap.values()) {
+        if (runs === 0) stats.maidens += 1;
+      }
     }
   }
 
@@ -583,16 +847,29 @@ export function LiveScoring({
         />
 
         {/* Status Messages */}
-        {loading && (
-          <div className="flex items-center justify-center gap-2 rounded-xl bg-blue-50 p-3">
+        {syncing && !syncError && (
+          <div className="flex items-center justify-center gap-2 rounded-xl bg-blue-50 p-3 border-2 border-blue-200">
             <div className="h-4 w-4 animate-spin rounded-full border-2 border-blue-600 border-t-transparent"></div>
             <p className="text-sm font-semibold text-blue-700">
-              Updating score...
+              Syncing to database...
             </p>
           </div>
         )}
-        {error && (
-          <div className="flex items-center gap-2 rounded-xl bg-red-50 p-3">
+        {syncError && (
+          <div className="flex items-center gap-2 rounded-xl bg-red-50 p-3 border-2 border-red-200">
+            <span className="text-lg">⚠️</span>
+            <div className="flex-1">
+              <p className="text-sm font-semibold text-red-700">
+                Sync error: {syncError}
+              </p>
+              <p className="text-xs text-red-600 mt-1">
+                Changes are saved locally. Please refresh the page.
+              </p>
+            </div>
+          </div>
+        )}
+        {error && !syncError && (
+          <div className="flex items-center gap-2 rounded-xl bg-red-50 p-3 border-2 border-red-200">
             <span className="text-lg">⚠️</span>
             <p className="text-sm font-semibold text-red-700">{error}</p>
           </div>
@@ -638,7 +915,9 @@ export function LiveScoring({
           nonStriker={nonStrikerStats}
           bowler={bowlerStatsEntry}
         />
+        {/* @ts-expect-error - PreviousBallsDisplay expects BallLike with required id, but we ensure all balls have IDs */}
         <PreviousBallsDisplay balls={balls} />
+        {/* @ts-expect-error - OverTimeline expects BallLike with required id, but we ensure all balls have IDs */}
         <OverTimeline balls={balls} />
       </div>
 
@@ -682,7 +961,21 @@ export function LiveScoring({
             striker={strikerStats}
             nonStriker={nonStrikerStats}
             bowler={bowlerStatsEntry}
-            balls={balls}
+            balls={balls.map((b) => ({
+              id: b.id || `temp-${b.overNumber}-${b.ballNumber}`,
+              overNumber: b.overNumber,
+              ballNumber: b.ballNumber,
+              runs: b.runs,
+              isWide: b.isWide,
+              isNoBall: b.isNoBall,
+              isWicket: b.isWicket,
+              batsmanId: b.batsmanId,
+              bowlerId: b.bowlerId,
+              strikerChanged: b.strikerChanged,
+              wicketType: (b.wicketType as string) ?? undefined,
+              fielderId: b.fielderId,
+              dismissedBatsmanId: b.dismissedBatsmanId,
+            }))}
             players={players}
           />
         </div>
