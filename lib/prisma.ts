@@ -9,9 +9,17 @@ const globalForPrisma = globalThis as unknown as {
 export const prisma =
   globalForPrisma.prisma ??
   new PrismaClient({
-    log: ["error", "warn"],
+    log: process.env.NODE_ENV === "development" ? ["error", "warn"] : ["error"],
+    // For serverless environments, ensure proper connection handling
+    datasources: {
+      db: {
+        url: process.env.DATABASE_URL,
+      },
+    },
   });
 
+// In serverless environments, we don't want to reuse the client across invocations
+// But we still need to prevent multiple instances in the same execution context
 if (process.env.NODE_ENV !== "production") {
   globalForPrisma.prisma = prisma;
 }

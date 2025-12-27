@@ -94,33 +94,34 @@ export async function POST(req: NextRequest, { params }: RouteProps) {
       id: tempBallId,
     };
 
-    // Start background database sync (don't await - fire and forget)
-    syncRecordBallToDatabase(inningsId, {
-      match,
-      innings,
-      batsmanId,
-      nonStrikerId,
-      bowlerId,
-      runs: Number(runs ?? 0),
-      isWide: Boolean(isWide),
-      isNoBall: Boolean(isNoBall),
-      isWicket: Boolean(isWicket),
-      wicketType,
-      fielderId: fielderId || undefined,
-      dismissedBatsmanId: dismissedBatsmanId || undefined,
-    }, calculationResult).catch((error) => {
-      console.error("Background sync error:", error);
-      // In production, you might want to queue this for retry
-    });
+    // Await database sync to ensure data is persisted before response
+    // In serverless environments, the function can terminate before async operations complete
+    let syncedData;
+    try {
+      syncedData = await syncRecordBallToDatabase(inningsId, {
+        match,
+        innings,
+        batsmanId,
+        nonStrikerId,
+        bowlerId,
+        runs: Number(runs ?? 0),
+        isWide: Boolean(isWide),
+        isNoBall: Boolean(isNoBall),
+        isWicket: Boolean(isWicket),
+        wicketType,
+        fielderId: fielderId || undefined,
+        dismissedBatsmanId: dismissedBatsmanId || undefined,
+      }, calculationResult);
+    } catch (error) {
+      console.error("Database sync error:", error);
+      return NextResponse.json(
+        { error: "Failed to save ball to database" },
+        { status: 500 }
+      );
+    }
 
-    // Use calculated result for immediate response
-    const updatedInnings = {
-      ...innings,
-      totalRuns: calculationResult.updatedInnings.totalRuns,
-      wickets: calculationResult.updatedInnings.wickets,
-      overs: calculationResult.updatedInnings.overs,
-      ballsInOver: calculationResult.updatedInnings.ballsInOver,
-    };
+    // Use synced data from database for response
+    const updatedInnings = syncedData.innings;
 
     // Get all match players to calculate actual batting team size
     const matchPlayers = await prisma.matchPlayer.findMany({
@@ -164,13 +165,12 @@ export async function POST(req: NextRequest, { params }: RouteProps) {
     return NextResponse.json(
       {
         innings: updatedInnings,
-        ball: ballWithId,
+        ball: syncedData.ball, // Use the actual ball from database
         canCompleteInnings,
         isAllOut,
         isOversComplete,
         isTargetReached,
         inningsNumber: updatedInnings.inningsNumber,
-        syncing: true, // Flag to indicate background sync is in progress
       },
       { status: 201 }
     );
@@ -222,22 +222,22 @@ export async function DELETE(_req: NextRequest, { params }: RouteProps) {
       innings,
     });
 
-    // Start background database sync
-    syncUndoBallToDatabase(inningsId, calculationResult).catch((error) => {
-      console.error("Background sync error (undo):", error);
-    });
+    // Await database sync to ensure data is persisted
+    let syncedData;
+    try {
+      syncedData = await syncUndoBallToDatabase(inningsId, calculationResult);
+    } catch (error) {
+      console.error("Database sync error (undo):", error);
+      return NextResponse.json(
+        { error: "Failed to undo ball in database" },
+        { status: 500 }
+      );
+    }
 
-    // Return calculated result immediately
+    // Return synced result from database
     return NextResponse.json({
-      innings: {
-        ...innings,
-        totalRuns: calculationResult.updatedInnings.totalRuns,
-        wickets: calculationResult.updatedInnings.wickets,
-        overs: calculationResult.updatedInnings.overs,
-        ballsInOver: calculationResult.updatedInnings.ballsInOver,
-      },
-      deletedBall: calculationResult.deletedBall,
-      syncing: true,
+      innings: syncedData.innings,
+      deletedBall: syncedData.deletedBall,
     });
   } catch (error) {
     console.error(error);
