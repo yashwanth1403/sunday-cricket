@@ -52,6 +52,44 @@ export default async function LivePage({ params }: PageProps) {
     orderBy: [{ overNumber: "asc" }, { ballNumber: "asc" }],
   });
 
+  // Fetch first innings data if we're in second innings
+  let firstInningsData = null;
+  if (currentInnings.inningsNumber === 2 && firstInnings) {
+    const firstInningsBalls = await prisma.ball.findMany({
+      where: { inningsId: firstInnings.id },
+      orderBy: [{ overNumber: "asc" }, { ballNumber: "asc" }],
+    });
+    
+    firstInningsData = {
+      inningsNumber: 1,
+      battingTeamName: firstInnings.battingTeam === "A" ? match.teamA : match.teamB,
+      bowlingTeamName: firstInnings.bowlingTeam === "A" ? match.teamA : match.teamB,
+      score: {
+        totalRuns: firstInnings.totalRuns,
+        wickets: firstInnings.wickets,
+        overs: firstInnings.overs,
+        ballsInOver: firstInnings.ballsInOver,
+      },
+      balls: firstInningsBalls.map((b) => ({
+        id: b.id,
+        overNumber: b.overNumber,
+        ballNumber: b.ballNumber,
+        runs: b.runs,
+        isWide: b.isWide,
+        isNoBall: b.isNoBall,
+        isWicket: b.isWicket,
+        batsmanId: b.batsmanId,
+        nonStrikerId: b.nonStrikerId,
+        bowlerId: b.bowlerId,
+        strikerChanged: b.strikerChanged,
+        wicketType: b.wicketType,
+        fielderId: b.fielderId,
+        dismissedBatsmanId: b.dismissedBatsmanId,
+      })),
+      isCompleted: firstInnings.status === "COMPLETED",
+    };
+  }
+
   // Calculate target runs for 2nd innings
   const targetRuns =
     currentInnings.inningsNumber === 2 && firstInnings
@@ -90,6 +128,7 @@ export default async function LivePage({ params }: PageProps) {
             overs: currentInnings.overs,
             ballsInOver: currentInnings.ballsInOver,
           }}
+          firstInningsData={firstInningsData}
         />
       </main>
     </div>

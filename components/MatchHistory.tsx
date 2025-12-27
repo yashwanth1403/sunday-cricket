@@ -1,5 +1,14 @@
 import Link from "next/link";
 
+// Helper function to format date consistently (avoiding hydration mismatch)
+function formatDate(dateString: string): string {
+  const date = new Date(dateString);
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  const year = date.getFullYear();
+  return `${month}/${day}/${year}`;
+}
+
 type MatchHistoryItem = {
   id: string;
   name: string;
@@ -7,6 +16,7 @@ type MatchHistoryItem = {
   teamA: string;
   teamB: string;
   winner?: "A" | "B" | null;
+  status: "SCHEDULED" | "IN_PROGRESS" | "COMPLETED";
   manOfMatchName?: string | null;
 };
 
@@ -39,10 +49,17 @@ export function MatchHistory({ matches }: Props) {
         {matches.map((m) => {
           const winnerName =
             m.winner === "A" ? m.teamA : m.winner === "B" ? m.teamB : undefined;
+          // Determine the route based on match status
+          // Use explicit string comparison to ensure COMPLETED status routes to complete page
+          const statusStr = String(m.status).toUpperCase();
+          const matchRoute =
+            statusStr === "COMPLETED"
+              ? `/matches/${m.id}/complete`
+              : `/matches/${m.id}/live`;
           return (
             <li key={m.id}>
               <Link
-                href={`/matches/${m.id}`}
+                href={matchRoute}
                 className="block rounded-xl border-2 border-slate-200 bg-gradient-to-r from-white to-slate-50 p-4 transition-all hover:border-blue-300 hover:shadow-md active:scale-[0.98]"
               >
                 <div className="flex items-start justify-between gap-3">
@@ -58,7 +75,7 @@ export function MatchHistory({ matches }: Props) {
                       )}
                     </div>
                     <div className="mt-1.5 flex flex-wrap items-center gap-2 text-xs text-slate-600">
-                      <span>📆 {new Date(m.date).toLocaleDateString()}</span>
+                      <span>📆 {formatDate(m.date)}</span>
                       {!winnerName && (
                         <span className="rounded-full bg-orange-100 px-2 py-0.5 font-medium text-orange-700">
                           🔴 Live
@@ -98,5 +115,3 @@ export function MatchHistory({ matches }: Props) {
     </div>
   );
 }
-
-

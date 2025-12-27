@@ -33,8 +33,28 @@ export async function recordBall(
     orderBy: [{ overNumber: "asc" }, { ballNumber: "asc" }],
   });
 
+  // Ensure balls are sorted by overNumber and ballNumber for correct streak calculation
+  const sortedBalls = [...existingBalls].sort((a, b) => {
+    if (a.overNumber !== b.overNumber) {
+      return a.overNumber - b.overNumber;
+    }
+    return a.ballNumber - b.ballNumber;
+  });
+
+  console.log(
+    `[DEBUG] recordBall (server): Sorted ${sortedBalls.length} existing balls:`,
+    sortedBalls
+      .map(
+        (b) =>
+          `${b.overNumber}.${b.ballNumber}(${
+            b.isWide ? "W" : b.isNoBall ? "N" : b.runs
+          })`
+      )
+      .join(", ")
+  );
+
   const illegalStreakBefore = getIllegalStreak(
-    existingBalls.map((b) => ({ isWide: b.isWide, isNoBall: b.isNoBall }))
+    sortedBalls.map((b) => ({ isWide: b.isWide, isNoBall: b.isNoBall }))
   );
   const isLegal = !input.isWide && !input.isNoBall;
 
@@ -54,9 +74,21 @@ export async function recordBall(
     isNoBall: input.isNoBall,
   });
 
-  const newIllegalStreak =
-    illegalStreakBefore + (input.isWide || input.isNoBall ? 1 : 0);
-  const bonusIllegalRun = extraRunForIllegalPair(newIllegalStreak);
+  const isNewBallIllegal = input.isWide || input.isNoBall;
+  const newIllegalStreak = illegalStreakBefore + (isNewBallIllegal ? 1 : 0);
+  // Only award bonus if the new ball is illegal (streak continues)
+  // If the new ball is legal, the streak is broken and no bonus is awarded
+  const bonusIllegalRun = isNewBallIllegal
+    ? extraRunForIllegalPair(newIllegalStreak)
+    : 0;
+
+  console.log(
+    `[DEBUG] recordBall (server): existingBalls=${
+      existingBalls.length
+    }, illegalStreakBefore=${illegalStreakBefore}, isNewBallIllegal=${isNewBallIllegal}, newIllegalStreak=${newIllegalStreak}, bonusIllegalRun=${bonusIllegalRun}, input.runs=${
+      input.runs
+    }, final ball.runs=${input.runs + bonusIllegalRun}`
+  );
 
   // Determine which batsman was dismissed
   let dismissedBatsmanId: string | null = null;
@@ -70,44 +102,64 @@ export async function recordBall(
     }
   }
 
-  const createdBall = await prisma.ball.create({
-    data: {
-      inningsId,
-      overNumber,
-      ballNumber,
-      batsmanId: input.batsmanId,
-      nonStrikerId: input.nonStrikerId,
-      bowlerId: input.bowlerId,
-      runs: input.runs + bonusIllegalRun,
-      isWide: input.isWide,
-      isNoBall: input.isNoBall,
-      isWicket: input.isWicket,
-      wicketType: input.wicketType ?? null,
-      fielderId: input.fielderId ?? null,
-      dismissedBatsmanId: dismissedBatsmanId,
-      strikerChanged: changeStrike,
-    },
-  });
-
-  const allBalls = [...existingBalls, createdBall];
+  // Pre-calculate stats before transaction
+  // Create a temporary ball object with all required fields for calculateStats
+  const tempBall: Ball = {
+    id: "temp",
+    createdAt: new Date(),
+    inningsId,
+    overNumber,
+    ballNumber,
+    batsmanId: input.batsmanId,
+    nonStrikerId: input.nonStrikerId,
+    bowlerId: input.bowlerId,
+    runs: input.runs + bonusIllegalRun,
+    isWide: input.isWide,
+    isNoBall: input.isNoBall,
+    isWicket: input.isWicket,
+    wicketType: input.wicketType ?? null,
+    fielderId: input.fielderId ?? null,
+    dismissedBatsmanId: dismissedBatsmanId,
+    strikerChanged: changeStrike,
+  };
+  const allBalls = [...existingBalls, tempBall];
   const { totalRuns, wickets, statsByPlayer } = calculateStats(allBalls);
-
   const overProgress = updateOverProgress(input.innings, isLegal);
 
-  const updatedInnings = await prisma.innings.update({
-    where: { id: inningsId },
-    data: {
-      totalRuns,
-      wickets,
-      overs: overProgress.overs,
-      ballsInOver: overProgress.ballsInOver,
-    },
-  });
-
-  // Upsert player stats for this match+innings
+  // Use transaction for atomicity and better performance
   const matchId = input.match.id;
-  await Promise.all(
-    Object.entries(statsByPlayer).map(([playerId, s]) =>
+  const [createdBall, updatedInnings] = await prisma.$transaction([
+    // Create the ball
+    prisma.ball.create({
+      data: {
+        inningsId,
+        overNumber,
+        ballNumber,
+        batsmanId: input.batsmanId,
+        nonStrikerId: input.nonStrikerId,
+        bowlerId: input.bowlerId,
+        runs: input.runs + bonusIllegalRun,
+        isWide: input.isWide,
+        isNoBall: input.isNoBall,
+        isWicket: input.isWicket,
+        wicketType: input.wicketType ?? null,
+        fielderId: input.fielderId ?? null,
+        dismissedBatsmanId: dismissedBatsmanId,
+        strikerChanged: changeStrike,
+      },
+    }),
+    // Update innings
+    prisma.innings.update({
+      where: { id: inningsId },
+      data: {
+        totalRuns,
+        wickets,
+        overs: overProgress.overs,
+        ballsInOver: overProgress.ballsInOver,
+      },
+    }),
+    // Batch upsert player stats (executed in parallel within transaction)
+    ...Object.entries(statsByPlayer).map(([playerId, s]) =>
       prisma.playerMatchStats.upsert({
         where: {
           matchId_inningsId_playerId: {
@@ -124,8 +176,8 @@ export async function recordBall(
           ...s,
         },
       })
-    )
-  );
+    ),
+  ]);
 
   return { innings: updatedInnings, ball: createdBall };
 }
@@ -134,10 +186,34 @@ export async function undoLastBall(inningsId: string): Promise<{
   innings: Innings;
   deletedBall: Ball | null;
 }> {
-  const lastBall = await prisma.ball.findFirst({
+  // Get all balls and find the last one manually to handle same overNumber/ballNumber case
+  const allBalls = await prisma.ball.findMany({
     where: { inningsId },
-    orderBy: [{ overNumber: "desc" }, { ballNumber: "desc" }],
+    orderBy: [{ createdAt: "asc" }], // Get in creation order
   });
+
+  if (allBalls.length === 0) {
+    return {
+      innings: await prisma.innings.findUniqueOrThrow({
+        where: { id: inningsId },
+      }),
+      deletedBall: null,
+    };
+  }
+
+  // Sort by overNumber, ballNumber, then by creation time (last created = last ball)
+  const sortedBalls = [...allBalls].sort((a, b) => {
+    if (a.overNumber !== b.overNumber) {
+      return b.overNumber - a.overNumber;
+    }
+    if (a.ballNumber !== b.ballNumber) {
+      return b.ballNumber - a.ballNumber;
+    }
+    // If same over and ball number, use creation time (last created = last ball)
+    return b.createdAt.getTime() - a.createdAt.getTime();
+  });
+
+  const lastBall = sortedBalls[0];
 
   if (!lastBall) {
     return {
@@ -148,26 +224,30 @@ export async function undoLastBall(inningsId: string): Promise<{
     };
   }
 
-  await prisma.ball.delete({ where: { id: lastBall.id } });
+  // Get innings and match in parallel
+  const [innings, remainingBalls] = await Promise.all([
+    prisma.innings.findUniqueOrThrow({
+      where: { id: inningsId },
+    }),
+    prisma.ball.findMany({
+      where: { inningsId },
+      orderBy: [{ overNumber: "asc" }, { ballNumber: "asc" }],
+    }),
+  ]);
 
-  const innings = await prisma.innings.findUniqueOrThrow({
-    where: { id: inningsId },
-  });
-  const match = await prisma.match.findUniqueOrThrow({
-    where: { id: innings.matchId },
-  });
+  // Filter out the last ball from remaining balls
+  const filteredRemainingBalls = remainingBalls.filter(
+    (b) => b.id !== lastBall.id
+  );
 
-  const remainingBalls = await prisma.ball.findMany({
-    where: { inningsId },
-    orderBy: [{ overNumber: "asc" }, { ballNumber: "asc" }],
-  });
-
-  const { totalRuns, wickets, statsByPlayer } = calculateStats(remainingBalls);
+  const { totalRuns, wickets, statsByPlayer } = calculateStats(
+    filteredRemainingBalls
+  );
 
   // recompute overs/ballsInOver from remaining balls
   let overs = 0;
   let ballsInOver = 0;
-  for (const b of remainingBalls) {
+  for (const b of filteredRemainingBalls) {
     const isLegal = !b.isWide && !b.isNoBall;
     if (!isLegal) continue;
     ballsInOver += 1;
@@ -177,66 +257,51 @@ export async function undoLastBall(inningsId: string): Promise<{
     }
   }
 
-  const updatedInnings = await prisma.innings.update({
-    where: { id: inningsId },
-    data: {
-      totalRuns,
-      wickets,
-      overs,
-      ballsInOver,
-    },
-  });
+  const matchId = innings.matchId;
 
-  const matchId = match.id;
-  await prisma.playerMatchStats.deleteMany({
-    where: { matchId, inningsId },
-  });
-
-  await Promise.all(
-    Object.entries(statsByPlayer).map(([playerId, s]) =>
-      prisma.playerMatchStats.create({
-        data: {
+  // Use transaction for atomicity and better performance
+  // Replace delete+recreate with upserts (more efficient)
+  const [deletedBall, updatedInnings] = await prisma.$transaction([
+    // Delete the ball
+    prisma.ball.delete({ where: { id: lastBall.id } }),
+    // Update innings
+    prisma.innings.update({
+      where: { id: inningsId },
+      data: {
+        totalRuns,
+        wickets,
+        overs,
+        ballsInOver,
+      },
+    }),
+    // Upsert player stats instead of delete+recreate (more efficient)
+    ...Object.entries(statsByPlayer).map(([playerId, s]) =>
+      prisma.playerMatchStats.upsert({
+        where: {
+          matchId_inningsId_playerId: {
+            matchId,
+            inningsId,
+            playerId,
+          },
+        },
+        update: s,
+        create: {
           matchId,
           inningsId,
           playerId,
           ...s,
         },
       })
-    )
-  );
+    ),
+  ]);
 
-  return { innings: updatedInnings, deletedBall: lastBall };
-}
-
-/**
- * Retry helper function
- */
-async function retryOperation<T>(
-  operation: () => Promise<T>,
-  maxRetries: number = 3,
-  delay: number = 1000
-): Promise<T> {
-  let lastError: Error | unknown;
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      return await operation();
-    } catch (error) {
-      lastError = error;
-      if (attempt < maxRetries) {
-        // Exponential backoff
-        const waitTime = delay * Math.pow(2, attempt - 1);
-        await new Promise((resolve) => setTimeout(resolve, waitTime));
-      }
-    }
-  }
-  throw lastError;
+  return { innings: updatedInnings, deletedBall };
 }
 
 /**
  * Background database sync for recording a ball
  * This function performs all database operations asynchronously
  * and should not block the API response
- * Includes retry logic for better reliability on slow connections
  */
 export async function syncRecordBallToDatabase(
   inningsId: string,
@@ -255,42 +320,43 @@ export async function syncRecordBallToDatabase(
     >;
   }
 ): Promise<{ innings: Innings; ball: Ball }> {
-  return retryOperation(async () => {
-    // Create the ball in database
-    const createdBall = await prisma.ball.create({
-      data: {
-        inningsId,
-        overNumber: calculationResult.ball.overNumber,
-        ballNumber: calculationResult.ball.ballNumber,
-        batsmanId: calculationResult.ball.batsmanId,
-        nonStrikerId: calculationResult.ball.nonStrikerId,
-        bowlerId: calculationResult.ball.bowlerId,
-        runs: calculationResult.ball.runs,
-        isWide: calculationResult.ball.isWide,
-        isNoBall: calculationResult.ball.isNoBall,
-        isWicket: calculationResult.ball.isWicket,
-        wicketType: calculationResult.ball.wicketType ?? null,
-        fielderId: calculationResult.ball.fielderId ?? null,
-        dismissedBatsmanId: calculationResult.ball.dismissedBatsmanId,
-        strikerChanged: calculationResult.ball.strikerChanged ?? false,
-      },
-    });
-
-    // Update innings
-    const updatedInnings = await prisma.innings.update({
-      where: { id: inningsId },
-      data: {
-        totalRuns: calculationResult.updatedInnings.totalRuns,
-        wickets: calculationResult.updatedInnings.wickets,
-        overs: calculationResult.updatedInnings.overs,
-        ballsInOver: calculationResult.updatedInnings.ballsInOver,
-      },
-    });
-
-    // Upsert player stats (batch operation for better performance)
+  try {
     const matchId = input.match.id;
-    await Promise.all(
-      Object.entries(calculationResult.statsByPlayer).map(([playerId, s]) =>
+
+    // Use transaction for atomicity and better performance
+    // All operations execute in a single database round trip
+    const [createdBall, updatedInnings] = await prisma.$transaction([
+      // Create the ball
+      prisma.ball.create({
+        data: {
+          inningsId,
+          overNumber: calculationResult.ball.overNumber,
+          ballNumber: calculationResult.ball.ballNumber,
+          batsmanId: calculationResult.ball.batsmanId,
+          nonStrikerId: calculationResult.ball.nonStrikerId,
+          bowlerId: calculationResult.ball.bowlerId,
+          runs: calculationResult.ball.runs,
+          isWide: calculationResult.ball.isWide,
+          isNoBall: calculationResult.ball.isNoBall,
+          isWicket: calculationResult.ball.isWicket,
+          wicketType: calculationResult.ball.wicketType ?? null,
+          fielderId: calculationResult.ball.fielderId ?? null,
+          dismissedBatsmanId: calculationResult.ball.dismissedBatsmanId,
+          strikerChanged: calculationResult.ball.strikerChanged ?? false,
+        },
+      }),
+      // Update innings
+      prisma.innings.update({
+        where: { id: inningsId },
+        data: {
+          totalRuns: calculationResult.updatedInnings.totalRuns,
+          wickets: calculationResult.updatedInnings.wickets,
+          overs: calculationResult.updatedInnings.overs,
+          ballsInOver: calculationResult.updatedInnings.ballsInOver,
+        },
+      }),
+      // Batch upsert player stats (executed in parallel within transaction)
+      ...Object.entries(calculationResult.statsByPlayer).map(([playerId, s]) =>
         prisma.playerMatchStats.upsert({
           where: {
             matchId_inningsId_playerId: {
@@ -307,20 +373,22 @@ export async function syncRecordBallToDatabase(
             ...s,
           },
         })
-      )
-    );
+      ),
+    ]);
 
-    return { innings: updatedInnings, ball: createdBall };
-  }, 3, 1000).catch((error) => {
-    console.error("Error syncing ball to database after retries:", error);
-    // Log to error tracking service in production
+    // Extract the results (first two are ball and innings, rest are stats)
+    const ball = createdBall;
+    const innings = updatedInnings;
+
+    return { innings, ball };
+  } catch (error) {
+    console.error("Error syncing ball to database:", error);
     throw error;
-  });
+  }
 }
 
 /**
  * Background database sync for undoing a ball
- * Includes retry logic for better reliability
  */
 export async function syncUndoBallToDatabase(
   inningsId: string,
@@ -335,7 +403,7 @@ export async function syncUndoBallToDatabase(
     deletedBall: BallLike | null;
   }
 ): Promise<{ innings: Innings; deletedBall: Ball | null }> {
-  return retryOperation(async () => {
+  try {
     if (!calculationResult.deletedBall || !calculationResult.deletedBall.id) {
       // No ball to delete, just return current innings
       const innings = await prisma.innings.findUniqueOrThrow({
@@ -344,59 +412,70 @@ export async function syncUndoBallToDatabase(
       return { innings, deletedBall: null };
     }
 
-    // Delete the ball
-    const deletedBall = await prisma.ball.delete({
-      where: { id: calculationResult.deletedBall.id },
-    });
-
-    // Update innings
-    const updatedInnings = await prisma.innings.update({
-      where: { id: inningsId },
-      data: {
-        totalRuns: calculationResult.updatedInnings.totalRuns,
-        wickets: calculationResult.updatedInnings.wickets,
-        overs: calculationResult.updatedInnings.overs,
-        ballsInOver: calculationResult.updatedInnings.ballsInOver,
-      },
-    });
-
-    // Get match for player stats update
+    // Get innings once to get matchId (avoid redundant query)
     const innings = await prisma.innings.findUniqueOrThrow({
       where: { id: inningsId },
+      select: { matchId: true },
     });
     const matchId = innings.matchId;
 
-    // Delete all player stats for this innings and recreate from remaining balls
-    await prisma.playerMatchStats.deleteMany({
-      where: { matchId, inningsId },
-    });
-
-    // Recalculate stats from remaining balls
-    const remainingBalls = await prisma.ball.findMany({
+    // Fetch remaining balls from database to get full Ball objects for calculateStats
+    // We need to do this before deleting the ball to get accurate remaining balls
+    const allBallsBeforeDelete = await prisma.ball.findMany({
       where: { inningsId },
       orderBy: [{ overNumber: "asc" }, { ballNumber: "asc" }],
     });
 
+    // Filter out the ball we're about to delete
+    const deletedBallId = calculationResult.deletedBall?.id;
+    const remainingBalls = deletedBallId
+      ? allBallsBeforeDelete.filter((b) => b.id !== deletedBallId)
+      : allBallsBeforeDelete;
+
+    // Recalculate stats from remaining balls
     const { statsByPlayer } = calculateStats(remainingBalls);
 
-    // Create player stats from remaining balls (batch operation)
-    await Promise.all(
-      Object.entries(statsByPlayer).map(([playerId, s]) =>
-        prisma.playerMatchStats.create({
-          data: {
+    // Use transaction for atomicity and better performance
+    // Replace delete+recreate pattern with upserts (more efficient)
+    const [deletedBall, updatedInnings] = await prisma.$transaction([
+      // Delete the ball
+      prisma.ball.delete({
+        where: { id: calculationResult.deletedBall.id },
+      }),
+      // Update innings
+      prisma.innings.update({
+        where: { id: inningsId },
+        data: {
+          totalRuns: calculationResult.updatedInnings.totalRuns,
+          wickets: calculationResult.updatedInnings.wickets,
+          overs: calculationResult.updatedInnings.overs,
+          ballsInOver: calculationResult.updatedInnings.ballsInOver,
+        },
+      }),
+      // Upsert player stats instead of delete+recreate (more efficient)
+      ...Object.entries(statsByPlayer).map(([playerId, s]) =>
+        prisma.playerMatchStats.upsert({
+          where: {
+            matchId_inningsId_playerId: {
+              matchId,
+              inningsId,
+              playerId,
+            },
+          },
+          update: s,
+          create: {
             matchId,
             inningsId,
             playerId,
             ...s,
           },
         })
-      )
-    );
+      ),
+    ]);
 
     return { innings: updatedInnings, deletedBall };
-  }, 3, 1000).catch((error) => {
-    console.error("Error syncing undo to database after retries:", error);
-    // Log to error tracking service in production
+  } catch (error) {
+    console.error("Error syncing undo to database:", error);
     throw error;
-  });
+  }
 }

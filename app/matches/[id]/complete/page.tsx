@@ -1,5 +1,6 @@
 import { notFound } from "next/navigation";
 import { prisma } from "@/lib/prisma";
+import { InningsScorecard } from "@/components/InningsScorecard";
 
 interface PageProps {
   params: Promise<{
@@ -15,6 +16,14 @@ export default async function MatchCompletePage({ params }: PageProps) {
     include: {
       innings: {
         orderBy: { inningsNumber: "asc" },
+        include: {
+          balls: {
+            orderBy: [{ overNumber: "asc" }, { ballNumber: "asc" }],
+          },
+        },
+      },
+      players: {
+        include: { player: true },
       },
       playerStats: {
         include: { player: true },
@@ -26,6 +35,14 @@ export default async function MatchCompletePage({ params }: PageProps) {
   if (!match) notFound();
 
   const [firstInnings, secondInnings] = match.innings;
+  
+  // Get all players for the match
+  const players = match.players.map((mp) => ({
+    id: mp.playerId,
+    name: mp.player.name,
+    team: mp.team,
+    isDualPlayer: mp.isDualPlayer,
+  }));
 
   // Aggregate player stats across both innings
   const aggregatedStats = new Map<
@@ -92,7 +109,7 @@ export default async function MatchCompletePage({ params }: PageProps) {
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-slate-50 to-slate-100">
-      <main className="mx-auto max-w-3xl px-4 py-4 sm:py-6">
+      <main className="mx-auto max-w-4xl px-3 py-4 sm:px-4 sm:py-6">
         <header className="mb-6 rounded-2xl bg-gradient-to-r from-blue-600 to-blue-700 p-5 text-white shadow-lg">
           <h1 className="flex items-center gap-2 text-xl font-bold sm:text-2xl">
             <span>🏆</span>
@@ -127,30 +144,85 @@ export default async function MatchCompletePage({ params }: PageProps) {
           )}
         </header>
 
-        <section className="mb-6 grid gap-4 md:grid-cols-2">
+        {/* Scorecards Section */}
+        <section className="mb-6 space-y-4 sm:space-y-6">
+          <h2 className="text-lg sm:text-xl font-bold text-slate-900">Scorecard</h2>
+          
           {firstInnings && (
-            <div className="rounded-2xl bg-white p-4 shadow-md">
-              <div className="mb-2 flex items-center gap-2 text-xs font-bold uppercase tracking-wide text-slate-600">
-                <span>1️⃣</span>
-                <span>1st Innings</span>
-              </div>
-              <p className="text-lg font-bold text-slate-800">
-                {firstInnings.totalRuns}/{firstInnings.wickets} in{" "}
-                {firstInnings.overs} overs
-              </p>
-            </div>
+            <InningsScorecard
+              inningsNumber={1}
+              battingTeamName={
+                firstInnings.battingTeam === "A" ? match.teamA : match.teamB
+              }
+              bowlingTeamName={
+                firstInnings.bowlingTeam === "A" ? match.teamA : match.teamB
+              }
+              score={{
+                totalRuns: firstInnings.totalRuns,
+                wickets: firstInnings.wickets,
+                overs: firstInnings.overs,
+                ballsInOver: firstInnings.ballsInOver,
+              }}
+              totalOvers={match.totalOvers}
+              balls={firstInnings.balls.map((b) => ({
+                id: b.id,
+                overNumber: b.overNumber,
+                ballNumber: b.ballNumber,
+                runs: b.runs,
+                isWide: b.isWide,
+                isNoBall: b.isNoBall,
+                isWicket: b.isWicket,
+                batsmanId: b.batsmanId,
+                nonStrikerId: b.nonStrikerId,
+                bowlerId: b.bowlerId,
+                strikerChanged: b.strikerChanged,
+                wicketType: b.wicketType,
+                fielderId: b.fielderId,
+                dismissedBatsmanId: b.dismissedBatsmanId,
+              }))}
+              players={players}
+              isCompleted={firstInnings.status === "COMPLETED"}
+            />
           )}
+          
           {secondInnings && (
-            <div className="rounded-2xl bg-white p-4 shadow-md">
-              <div className="mb-2 flex items-center gap-2 text-xs font-bold uppercase tracking-wide text-slate-600">
-                <span>2️⃣</span>
-                <span>2nd Innings</span>
-              </div>
-              <p className="text-lg font-bold text-slate-800">
-                {secondInnings.totalRuns}/{secondInnings.wickets} in{" "}
-                {secondInnings.overs} overs
-              </p>
-            </div>
+            <InningsScorecard
+              inningsNumber={2}
+              battingTeamName={
+                secondInnings.battingTeam === "A" ? match.teamA : match.teamB
+              }
+              bowlingTeamName={
+                secondInnings.bowlingTeam === "A" ? match.teamA : match.teamB
+              }
+              score={{
+                totalRuns: secondInnings.totalRuns,
+                wickets: secondInnings.wickets,
+                overs: secondInnings.overs,
+                ballsInOver: secondInnings.ballsInOver,
+              }}
+              totalOvers={match.totalOvers}
+              targetRuns={
+                firstInnings ? firstInnings.totalRuns + 1 : null
+              }
+              balls={secondInnings.balls.map((b) => ({
+                id: b.id,
+                overNumber: b.overNumber,
+                ballNumber: b.ballNumber,
+                runs: b.runs,
+                isWide: b.isWide,
+                isNoBall: b.isNoBall,
+                isWicket: b.isWicket,
+                batsmanId: b.batsmanId,
+                nonStrikerId: b.nonStrikerId,
+                bowlerId: b.bowlerId,
+                strikerChanged: b.strikerChanged,
+                wicketType: b.wicketType,
+                fielderId: b.fielderId,
+                dismissedBatsmanId: b.dismissedBatsmanId,
+              }))}
+              players={players}
+              isCompleted={secondInnings.status === "COMPLETED"}
+            />
           )}
         </section>
 

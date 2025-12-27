@@ -5,6 +5,15 @@ import { prisma } from "@/lib/prisma";
 
 export const revalidate = 10; // Revalidate every 10 seconds
 
+// Helper function to format date consistently (avoiding hydration mismatch)
+function formatDate(dateString: string): string {
+  const date = new Date(dateString);
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  const year = date.getFullYear();
+  return `${month}/${day}/${year}`;
+}
+
 async function getHomeData() {
   try {
     const matchesData = await prisma.match.findMany({
@@ -23,12 +32,40 @@ async function getHomeData() {
       teamA: m.teamA,
       teamB: m.teamB,
       winner: m.winner,
+      status: m.status,
       manOfMatchName: m.manOfMatch?.name ?? null,
     }));
 
-    // Placeholder leaderboard derived from recent matches' player stats (can be
-    // replaced with dedicated /api/leaderboards later).
-    const topRuns: { playerId: string; name: string; value: number }[] = [];
+    // Get top run scorers by aggregating player stats across all matches
+    const playersWithStats = await prisma.player.findMany({
+      include: {
+        playerStats: true,
+      },
+    });
+
+    const topRuns = playersWithStats
+      .map((player) => {
+        const totalRuns = player.playerStats.reduce(
+          (sum, stat) => sum + stat.runs,
+          0
+        );
+        const totalMatches = new Set(
+          player.playerStats.map((stat) => stat.matchId)
+        ).size;
+
+        return {
+          playerId: player.id,
+          name: player.name,
+          value: totalRuns,
+          secondary:
+            totalMatches > 0
+              ? `${totalMatches} match${totalMatches !== 1 ? "es" : ""}`
+              : undefined,
+        };
+      })
+      .filter((p) => p.value > 0) // Only include players with runs
+      .sort((a, b) => b.value - a.value) // Sort by runs descending
+      .slice(0, 10); // Top 10
 
     return { matches, topRuns };
   } catch (error) {
@@ -68,6 +105,12 @@ export default async function Home() {
                 👥 Players
               </Link>
               <Link
+                href="/matches"
+                className="rounded-xl border-2 border-white/30 bg-white/10 px-4 py-2.5 text-center text-sm font-semibold text-white backdrop-blur-sm transition-all hover:bg-white/20 active:scale-95"
+              >
+                📅 Matches
+              </Link>
+              <Link
                 href="/matches/new"
                 className="rounded-xl bg-orange-500 px-4 py-2.5 text-center text-sm font-bold text-white shadow-md transition-all hover:bg-orange-600 active:scale-95"
               >
@@ -93,7 +136,7 @@ export default async function Home() {
                 </div>
                 <div className="text-sm text-white/90">
                   {latestMom.teamA} vs {latestMom.teamB} •{" "}
-                  {new Date(latestMom.date).toLocaleDateString()}
+                  {formatDate(latestMom.date)}
                 </div>
               </div>
             </div>

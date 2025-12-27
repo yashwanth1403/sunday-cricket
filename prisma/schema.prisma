@@ -120,6 +120,7 @@ model Innings {
   playerStats PlayerMatchStats[]
 
   @@unique([matchId, inningsNumber])
+  @@index([matchId]) // For faster lookups when fetching innings for a match
 }
 
 model Ball {
@@ -147,6 +148,8 @@ model Ball {
   fielder    Player? @relation("Fielder", fields: [fielderId], references: [id])
 
   @@index([inningsId, overNumber])
+  @@index([inningsId]) // For faster lookups when fetching all balls for an innings
+  @@index([createdAt]) // For faster sorting by creation time
 }
 
 model PlayerMatchStats {
@@ -179,6 +182,8 @@ model PlayerMatchStats {
   player  Player  @relation(fields: [playerId], references: [id], onDelete: Cascade)
 
   @@unique([matchId, inningsId, playerId])
+  @@index([matchId, inningsId]) // For faster lookups when fetching all stats for a match+innings
+  @@index([playerId]) // For faster lookups when fetching stats for a player
 }
 
 model Badge {

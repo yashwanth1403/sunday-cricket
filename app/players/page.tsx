@@ -1,4 +1,6 @@
 import Link from "next/link";
+import { DeletePlayerButton } from "@/components/DeletePlayerButton";
+import { BackButton } from "@/components/BackButton";
 import { prisma } from "@/lib/prisma";
 
 export default async function PlayersPage() {
@@ -32,6 +34,14 @@ export default async function PlayersPage() {
     );
     const totalRunsConceded = player.playerStats.reduce(
       (sum, s) => sum + s.runsConceded,
+      0
+    );
+    const totalWides = player.playerStats.reduce(
+      (sum, s) => sum + s.wides,
+      0
+    );
+    const totalNoBalls = player.playerStats.reduce(
+      (sum, s) => sum + s.noBalls,
       0
     );
     const totalCatches = player.playerStats.reduce(
@@ -69,6 +79,8 @@ export default async function PlayersPage() {
       totalWickets,
       totalBallsBowled,
       totalRunsConceded,
+      totalWides,
+      totalNoBalls,
       totalCatches,
       totalRunOuts,
       totalStumpings,
@@ -86,6 +98,9 @@ export default async function PlayersPage() {
     <div className="min-h-screen bg-gradient-to-b from-slate-50 to-slate-100">
       <main className="mx-auto max-w-4xl px-4 py-4 sm:py-6">
         <header className="mb-6 rounded-2xl bg-gradient-to-r from-blue-600 to-blue-700 p-5 text-white shadow-lg">
+          <div className="mb-3">
+            <BackButton href="/" label="Home" />
+          </div>
           <h1 className="flex items-center gap-2 text-2xl font-bold sm:text-3xl">
             <span>👥</span>
             <span>Players</span>
@@ -131,15 +146,31 @@ export default async function PlayersPage() {
                         </div>
                       )}
                     </div>
-                    {player.totalWickets > 0 && (
+                    {(player.totalWickets > 0 ||
+                      player.totalBallsBowled > 0 ||
+                      player.totalWides > 0 ||
+                      player.totalNoBalls > 0) && (
                       <div className="rounded-lg bg-orange-50 p-2">
                         <div className="text-slate-600">🎾 Bowling</div>
-                        <div className="mt-0.5 font-bold text-slate-800">
-                          {player.totalWickets} wickets
-                        </div>
+                        {player.totalWickets > 0 ? (
+                          <div className="mt-0.5 font-bold text-slate-800">
+                            {player.totalWickets} wickets
+                          </div>
+                        ) : (
+                          <div className="mt-0.5 font-bold text-slate-800">
+                            {player.totalBallsBowled > 0
+                              ? `${Math.floor(player.totalBallsBowled / 6)}.${player.totalBallsBowled % 6} overs`
+                              : "0 overs"}
+                          </div>
+                        )}
                         {player.totalBallsBowled > 0 && (
                           <div className="text-[10px] text-slate-500">
                             Econ: {player.economy}
+                          </div>
+                        )}
+                        {(player.totalWides > 0 || player.totalNoBalls > 0) && (
+                          <div className="mt-1 text-[10px] text-slate-500">
+                            W: {player.totalWides} | NB: {player.totalNoBalls}
                           </div>
                         )}
                       </div>
@@ -165,7 +196,11 @@ export default async function PlayersPage() {
                     </div>
                   </div>
                 </div>
-                <div className="flex-shrink-0">
+                <div className="flex flex-shrink-0 items-center gap-2">
+                  <DeletePlayerButton
+                    playerId={player.id}
+                    playerName={player.name}
+                  />
                   <div className="rounded-lg bg-blue-100 p-2 text-blue-600">
                     <svg
                       className="h-5 w-5"

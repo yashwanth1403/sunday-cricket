@@ -23,6 +23,8 @@ export default async function PlayerProfilePage({ params }: PageProps) {
               teamA: true,
               teamB: true,
               date: true,
+              status: true,
+              winner: true,
             },
           },
           innings: {
@@ -86,6 +88,14 @@ export default async function PlayerProfilePage({ params }: PageProps) {
   );
   const totalMaidens = player.playerStats.reduce(
     (sum, s) => sum + s.maidens,
+    0
+  );
+  const totalWides = player.playerStats.reduce(
+    (sum, s) => sum + s.wides,
+    0
+  );
+  const totalNoBalls = player.playerStats.reduce(
+    (sum, s) => sum + s.noBalls,
     0
   );
   const totalCatches = player.playerStats.reduce(
@@ -229,6 +239,14 @@ export default async function PlayerProfilePage({ params }: PageProps) {
                   </span>
                 </div>
               )}
+              {(totalWides > 0 || totalNoBalls > 0) && (
+                <div className="flex justify-between rounded-lg bg-red-50 p-2">
+                  <span className="text-slate-600">Wides / No Balls:</span>
+                  <span className="font-bold text-slate-800">
+                    {totalWides} / {totalNoBalls}
+                  </span>
+                </div>
+              )}
             </div>
           </div>
           <div className="rounded-2xl bg-white p-5 shadow-md">
@@ -263,67 +281,146 @@ export default async function PlayerProfilePage({ params }: PageProps) {
 
         {/* Match Performance */}
         {player.playerStats.length > 0 && (
-          <section className="rounded-2xl bg-emerald-900/70 p-4 text-xs text-emerald-50">
-            <div className="mb-3 text-[11px] font-semibold uppercase tracking-wide text-emerald-200">
-              Recent Match Performance
+          <section className="rounded-2xl bg-white p-5 shadow-md">
+            <div className="mb-4 flex items-center justify-between">
+              <h2 className="flex items-center gap-2 text-base font-bold text-slate-800">
+                <span>📊</span>
+                <span>Recent Match Performance</span>
+              </h2>
+              <Link
+                href={`/players/${id}/matches`}
+                className="rounded-lg border-2 border-blue-300 bg-blue-50 px-3 py-1.5 text-xs font-semibold text-blue-700 transition-all hover:bg-blue-100 active:scale-95"
+              >
+                View All →
+              </Link>
             </div>
-            <div className="space-y-2 max-h-96 overflow-y-auto">
+            <div className="space-y-3 max-h-96 overflow-y-auto">
               {player.playerStats.slice(0, 10).map((stat) => {
                 const matchDate = new Date(
                   stat.match.date
                 ).toLocaleDateString();
+                const statusStr = String(stat.match.status).toUpperCase();
+                const matchRoute =
+                  statusStr === "COMPLETED"
+                    ? `/matches/${stat.match.id}/complete`
+                    : `/matches/${stat.match.id}/live`;
+                const winnerName =
+                  stat.match.winner === "A"
+                    ? stat.match.teamA
+                    : stat.match.winner === "B"
+                    ? stat.match.teamB
+                    : null;
+
                 return (
-                  <div
+                  <Link
                     key={stat.id}
-                    className="rounded-lg bg-emerald-950/50 p-3"
+                    href={matchRoute}
+                    className="block rounded-xl border-2 border-slate-200 bg-gradient-to-r from-white to-slate-50 p-4 transition-all hover:border-blue-300 hover:shadow-md active:scale-[0.98]"
                   >
-                    <div className="mb-1 flex items-center justify-between">
-                      <span className="font-semibold">
-                        {stat.match.teamA} vs {stat.match.teamB}
-                      </span>
-                      <span className="text-emerald-400">{matchDate}</span>
+                    <div className="mb-3 flex items-start justify-between gap-3">
+                      <div className="flex-1">
+                        <div className="mb-1 flex items-center gap-2">
+                          <h3 className="font-bold text-slate-900">
+                            {stat.match.teamA} vs {stat.match.teamB}
+                          </h3>
+                          {winnerName && (
+                            <span className="rounded-full bg-green-100 px-2 py-0.5 text-[10px] font-semibold text-green-700">
+                              🏆 {winnerName}
+                            </span>
+                          )}
+                          {stat.match.status !== "COMPLETED" && (
+                            <span className="rounded-full bg-orange-100 px-2 py-0.5 text-[10px] font-medium text-orange-700">
+                              🔴 Live
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-xs text-slate-600">
+                          📆 {matchDate} • Innings {stat.innings.inningsNumber}
+                        </div>
+                      </div>
+                      {stat.runs > 0 && (
+                        <div className="flex-shrink-0 text-right">
+                          <div className="text-lg font-bold text-blue-600">
+                            {stat.runs}
+                          </div>
+                          <div className="text-[10px] text-slate-500">runs</div>
+                        </div>
+                      )}
                     </div>
-                    <div className="grid grid-cols-3 gap-2 text-[10px]">
+                    <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
                       {stat.runs > 0 || stat.ballsFaced > 0 ? (
-                        <div>
-                          <span className="text-emerald-300">Batting:</span>{" "}
-                          <span className="font-semibold">
+                        <div className="rounded-lg bg-blue-50 p-2">
+                          <div className="text-[10px] font-medium text-slate-600">
+                            🏏 Batting
+                          </div>
+                          <div className="mt-0.5 text-sm font-bold text-slate-800">
                             {stat.runs} ({stat.ballsFaced})
-                          </span>
+                          </div>
+                          {(stat.fours > 0 || stat.sixes > 0) && (
+                            <div className="mt-0.5 text-[10px] text-slate-500">
+                              {stat.fours}×4, {stat.sixes}×6
+                            </div>
+                          )}
                         </div>
                       ) : null}
-                      {stat.ballsBowled > 0 ? (
-                        <div>
-                          <span className="text-emerald-300">Bowling:</span>{" "}
-                          <span className="font-semibold">
-                            {stat.wickets}/{stat.runsConceded} (
-                            {Math.floor(stat.ballsBowled / 6)}.
-                            {stat.ballsBowled % 6})
-                          </span>
+                      {stat.ballsBowled > 0 ||
+                      stat.wickets > 0 ||
+                      stat.wides > 0 ||
+                      stat.noBalls > 0 ? (
+                        <div className="rounded-lg bg-orange-50 p-2">
+                          <div className="text-[10px] font-medium text-slate-600">
+                            🎾 Bowling
+                          </div>
+                          <div className="mt-0.5 text-sm font-bold text-slate-800">
+                            {stat.wickets}/{stat.runsConceded}
+                          </div>
+                          {stat.ballsBowled > 0 && (
+                            <div className="mt-0.5 text-[10px] text-slate-500">
+                              {Math.floor(stat.ballsBowled / 6)}.
+                              {stat.ballsBowled % 6} overs
+                            </div>
+                          )}
+                          {(stat.wides > 0 || stat.noBalls > 0) && (
+                            <div className="mt-0.5 text-[10px] text-slate-500">
+                              W:{stat.wides} NB:{stat.noBalls}
+                            </div>
+                          )}
                         </div>
                       ) : null}
                       {stat.catches > 0 ||
                       stat.runOuts > 0 ||
                       stat.stumpings > 0 ? (
-                        <div>
-                          <span className="text-emerald-300">Fielding:</span>{" "}
-                          <span className="font-semibold">
+                        <div className="rounded-lg bg-green-50 p-2">
+                          <div className="text-[10px] font-medium text-slate-600">
+                            ✋ Fielding
+                          </div>
+                          <div className="mt-0.5 text-sm font-bold text-slate-800">
                             {stat.catches + stat.runOuts + stat.stumpings}
-                          </span>
+                          </div>
+                          <div className="mt-0.5 text-[10px] text-slate-500">
+                            C:{stat.catches} RO:{stat.runOuts} S:
+                            {stat.stumpings}
+                          </div>
                         </div>
                       ) : null}
                     </div>
-                  </div>
+                  </Link>
                 );
               })}
             </div>
           </section>
         )}
 
-        <section className="rounded-2xl bg-emerald-900/70 p-3 text-xs text-emerald-50">
-          <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-emerald-200">
-            Badges
-          </div>
+        <section className="rounded-2xl bg-white p-5 shadow-md">
+          <h2 className="mb-4 flex items-center gap-2 text-base font-bold text-slate-800">
+            <span>🏆</span>
+            <span>Badges</span>
+            {player.badges.length > 0 && (
+              <span className="ml-auto rounded-full bg-purple-100 px-2.5 py-1 text-xs font-semibold text-purple-700">
+                {player.badges.length}
+              </span>
+            )}
+          </h2>
           <BadgeDisplay
             badges={player.badges.map((b) => ({
               id: b.id,

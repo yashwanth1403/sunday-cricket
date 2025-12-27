@@ -12,6 +12,8 @@ export interface CalculatedStats {
 }
 
 export function calculateStats(balls: Ball[]): CalculatedStats {
+  // Note: We process all balls because stats are cumulative (total runs, wickets, player stats)
+  // This is necessary for accuracy, but we minimize logging for performance
   const statsByPlayer: Record<string, MutableStats> = {};
   let totalRuns = 0;
   let wickets = 0;
@@ -59,9 +61,12 @@ export function calculateStats(balls: Ball[]): CalculatedStats {
 
     let runsThisBall = ball.runs;
     if (ball.isWide || ball.isNoBall) {
-      runsThisBall += 1; // base extra
+      // Box cricket rule: No base extra for illegal deliveries
+      // Only bonus run (in ball.runs) counts, which is awarded on 2nd, 4th, 6th consecutive illegal
+      // So runsThisBall = ball.runs (0 for 1st/3rd/5th, 1 for 2nd/4th/6th)
       if (ball.isWide) bowlStats.wides += 1;
       if (ball.isNoBall) bowlStats.noBalls += 1;
+      // Debug logging removed for performance - only log if needed for debugging
     }
 
     bowlStats.runsConceded += runsThisBall;

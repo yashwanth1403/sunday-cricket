@@ -7,6 +7,7 @@ import { OverTimeline } from "./OverTimeline";
 import { LiveStatsPanel } from "./LiveStatsPanel";
 import { MatchScorecard } from "./MatchScorecard";
 import { InningsCompleteModal } from "./InningsCompleteModal";
+import { InningsScorecard } from "./InningsScorecard";
 import {
   calculateRecordBallClient,
   calculateUndoBallClient,
@@ -18,8 +19,6 @@ type Player = {
   team: "A" | "B";
   isDualPlayer?: boolean;
 };
-
-import type { Ball } from "@prisma/client";
 
 type BallLike = {
   id?: string;
@@ -33,10 +32,24 @@ type BallLike = {
   nonStrikerId: string;
   bowlerId: string;
   strikerChanged?: boolean;
-  wicketType?: Ball["wicketType"] | null;
+  wicketType?: string | null;
   fielderId?: string | null;
   dismissedBatsmanId?: string | null;
 };
+
+interface FirstInningsData {
+  inningsNumber: number;
+  battingTeamName: string;
+  bowlingTeamName: string;
+  score: {
+    totalRuns: number;
+    wickets: number;
+    overs: number;
+    ballsInOver: number;
+  };
+  balls: BallLike[];
+  isCompleted: boolean;
+}
 
 interface LiveScoringProps {
   matchId: string;
@@ -56,6 +69,7 @@ interface LiveScoringProps {
     overs: number;
     ballsInOver: number;
   };
+  firstInningsData?: FirstInningsData | null;
 }
 
 export function LiveScoring({
@@ -71,15 +85,18 @@ export function LiveScoring({
   inningsNumber,
   targetRuns,
   initialScore,
+  firstInningsData,
 }: LiveScoringProps) {
   const [balls, setBalls] = useState<BallLike[]>(initialBalls);
   const [score, setScore] = useState(initialScore);
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [syncError, setSyncError] = useState<string | null>(null);
   const [showExitConfirm, setShowExitConfirm] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [showScorecard, setShowScorecard] = useState(false);
+  const [showFirstInnings, setShowFirstInnings] = useState(false);
   const [showInningsCompleteModal, setShowInningsCompleteModal] =
     useState(false);
   const [completingInnings, setCompletingInnings] = useState(false);
@@ -120,6 +137,9 @@ export function LiveScoring({
   const nonStriker = battingPlayers.find((p) => p.id === nonStrikerId);
   const bowler = bowlingPlayers.find((p) => p.id === bowlerId);
 
+  // Box cricket rule: Single bat when team.length - 1 wickets have fallen
+  const isSingleBatMode = score.wickets >= battingPlayers.length - 1;
+
   async function sendBall(payload: {
     runs: number;
     isWide?: boolean;
@@ -129,8 +149,22 @@ export function LiveScoring({
     fielderId?: string;
     dismissedBatsmanId?: string;
   }) {
-    if (!striker || !nonStriker || !bowler) {
-      setError("Select striker, non-striker, and bowler before scoring");
+    // Box cricket: In single bat mode, only striker and bowler are required
+    if (isSingleBatMode) {
+      if (!striker || !bowler) {
+        setError("Select striker and bowler before scoring");
+        return;
+      }
+    } else {
+      if (!striker || !nonStriker || !bowler) {
+        setError("Select striker, non-striker, and bowler before scoring");
+        return;
+      }
+    }
+
+    // Ensure nonStriker is defined for normal mode (TypeScript guard)
+    if (!isSingleBatMode && !nonStriker) {
+      setError("Select non-striker before scoring");
       return;
     }
     setError(null);
@@ -145,18 +179,23 @@ export function LiveScoring({
 
     try {
       // Calculate immediately on client side (optimistic update)
+      // Type assertion needed due to wicketType enum vs string difference
+      // Box cricket: In single bat mode, use striker as non-striker (required by API but not used)
+      const nonStrikerIdForCalc = isSingleBatMode
+        ? striker.id
+        : nonStriker?.id ?? striker.id;
       const calculation = calculateRecordBallClient(
-        balls,
+        balls as Parameters<typeof calculateRecordBallClient>[0],
         score,
         striker.id,
-        nonStriker.id,
+        nonStrikerIdForCalc,
         bowler.id,
         {
           runs: payload.runs ?? 0,
           isWide: payload.isWide ?? false,
           isNoBall: payload.isNoBall ?? false,
           isWicket: payload.isWicket ?? false,
-          wicketType: (payload.wicketType as Ball["wicketType"]) ?? null,
+          wicketType: payload.wicketType ?? null,
           fielderId: payload.fielderId ?? null,
           dismissedBatsmanId: payload.dismissedBatsmanId ?? null,
         }
@@ -167,7 +206,6 @@ export function LiveScoring({
       const ballWithId: BallLike = {
         ...calculation.ball,
         id: tempBallId,
-        wicketType: (calculation.ball.wicketType as Ball["wicketType"]) ?? null,
       };
 
       // Update state IMMEDIATELY (optimistic update)
@@ -178,6 +216,10 @@ export function LiveScoring({
       let newStrikerId = prevStrikerId;
       let newNonStrikerId = prevNonStrikerId;
       let newBowlerId = prevBowlerId;
+
+      // Check if we're entering single bat mode after this ball
+      const willBeSingleBatMode =
+        calculation.updatedScore.wickets >= battingPlayers.length - 1;
 
       // Handle wicket dismissal first (before strike rotation)
       if (calculation.ball.isWicket) {
@@ -195,77 +237,92 @@ export function LiveScoring({
         const availableBatsmen = battingPlayers.filter(
           (p) =>
             p.id !== prevStrikerId &&
-            p.id !== prevNonStrikerId &&
+            (!prevNonStrikerId || p.id !== prevNonStrikerId) &&
             !dismissedBatsmen.has(p.id)
         );
         const nextBatsman = availableBatsmen[0];
 
-        if (dismissedId === prevStrikerId) {
-          // Striker was dismissed
-          if (nextBatsman) {
-            // Non-striker moves to striker, new batsman to non-striker
-            newStrikerId = prevNonStrikerId;
-            newNonStrikerId = nextBatsman.id;
-          } else {
-            // No more batsmen - just swap positions
-            newStrikerId = prevNonStrikerId;
-            newNonStrikerId = undefined;
+        if (willBeSingleBatMode) {
+          // Single bat mode: only striker, no non-striker
+          if (dismissedId === prevStrikerId) {
+            // Striker was dismissed
+            if (nextBatsman) {
+              newStrikerId = nextBatsman.id;
+            } else {
+              // No more batsmen - all out
+              newStrikerId = undefined;
+            }
           }
-        } else if (dismissedId === prevNonStrikerId) {
-          // Non-striker was dismissed
-          if (nextBatsman) {
-            // Striker stays, new batsman to non-striker
-            newNonStrikerId = nextBatsman.id;
-          } else {
-            // No more batsmen
-            newNonStrikerId = undefined;
+          // In single bat mode, non-striker is always undefined
+          newNonStrikerId = undefined;
+        } else {
+          // Normal mode: striker and non-striker
+          if (dismissedId === prevStrikerId) {
+            // Striker was dismissed
+            if (nextBatsman) {
+              // Non-striker moves to striker, new batsman to non-striker
+              newStrikerId = prevNonStrikerId;
+              newNonStrikerId = nextBatsman.id;
+            } else {
+              // No more batsmen - just swap positions
+              newStrikerId = prevNonStrikerId;
+              newNonStrikerId = undefined;
+            }
+          } else if (dismissedId === prevNonStrikerId) {
+            // Non-striker was dismissed
+            if (nextBatsman) {
+              // Striker stays, new batsman to non-striker
+              newNonStrikerId = nextBatsman.id;
+            } else {
+              // No more batsmen
+              newNonStrikerId = undefined;
+            }
           }
         }
       } else {
         // No wicket - handle strike rotation
-        // On the 6th ball: if odd runs, apply BOTH swaps (odd run + over completion)
-        // This results in net no change (two swaps = back to original)
-        // On the 6th ball: if even runs, only apply over completion swap
-
-        const is6thBall = calculation.ball.ballNumber === 6;
-        const isOddRun = (payload.runs ?? 0) % 2 === 1;
-        const isLegalBall = !payload.isWide && !payload.isNoBall;
-
-        // First, apply per-ball strike rotation if needed
-        // For balls 1-5: apply if odd runs (calculation.strikerChanged handles this)
-        // For ball 6: apply if odd runs (even though shouldChangeStrike returns false)
-        if (prevStrikerId && prevNonStrikerId) {
-          if (is6thBall && isOddRun && isLegalBall) {
-            // 6th ball with odd runs: apply first swap (for the odd run)
-            newStrikerId = prevNonStrikerId;
-            newNonStrikerId = prevStrikerId;
-          } else if (calculation.strikerChanged && !is6thBall) {
-            // Balls 1-5: apply swap if odd runs
+        if (willBeSingleBatMode || isSingleBatMode) {
+          // Single bat mode: no strike rotation
+          // End of over - require new bowler selection
+          if (calculation.overCompleted) {
+            newBowlerId = undefined;
+          }
+        } else {
+          // Normal mode: handle strike rotation
+          // Per-ball strike rotation: odd runs change strike (but not on 6th ball)
+          if (
+            calculation.strikerChanged &&
+            prevStrikerId &&
+            prevNonStrikerId &&
+            calculation.ball.ballNumber !== 6
+          ) {
+            // Swap striker and non-striker for odd runs
             newStrikerId = prevNonStrikerId;
             newNonStrikerId = prevStrikerId;
           }
-        }
 
-        // Then, apply over completion swap (always happens on 6th ball)
-        // Use CURRENT positions (after first swap if it happened) for the second swap
-        if (calculation.overCompleted && newStrikerId && newNonStrikerId) {
-          // Over completed - swap positions again (this happens regardless of runs)
-          // If odd run on 6th ball: this is the second swap, canceling the first
-          // If even run on 6th ball: this is the only swap
-          const currentStriker = newStrikerId;
-          const currentNonStriker = newNonStrikerId;
-          newStrikerId = currentNonStriker;
-          newNonStrikerId = currentStriker;
-          newBowlerId = undefined; // Require new bowler selection
-        } else if (
-          calculation.overCompleted &&
-          prevStrikerId &&
-          prevNonStrikerId
-        ) {
-          // Fallback: if no first swap happened, use previous positions
-          newStrikerId = prevNonStrikerId;
-          newNonStrikerId = prevStrikerId;
-          newBowlerId = undefined; // Require new bowler selection
+          // End-of-over rotation: swap striker and non-striker after 6 legal balls
+          if (calculation.overCompleted && prevStrikerId && prevNonStrikerId) {
+            // Special case: If 6th ball had odd runs, we need to account for both rotations
+            // Odd run on 6th ball would normally swap, but over completion also swaps
+            // Net effect: if 6th ball had odd runs, don't swap (two swaps cancel out)
+            const is6thBallWithOddRuns =
+              calculation.ball.ballNumber === 6 &&
+              calculation.ball.runs % 2 === 1 &&
+              !calculation.ball.isWide &&
+              !calculation.ball.isNoBall;
+
+            if (is6thBallWithOddRuns) {
+              // Odd run on 6th ball: one swap for odd run + one swap for over = no net change
+              // So don't swap - strike stays with same player
+              // newStrikerId and newNonStrikerId remain unchanged
+            } else {
+              // Normal over completion - swap positions
+              newStrikerId = prevNonStrikerId;
+              newNonStrikerId = prevStrikerId;
+            }
+            newBowlerId = undefined; // Require new bowler selection
+          }
         }
       }
 
@@ -277,7 +334,8 @@ export function LiveScoring({
       }
 
       // Check if innings can be completed
-      const maxWickets = Math.max(0, battingPlayers.length - 1);
+      // Box cricket: All wickets must fall (all players dismissed)
+      const maxWickets = battingPlayers.length;
       const isAllOut = calculation.updatedScore.wickets >= maxWickets;
       const isOversComplete = calculation.updatedScore.overs >= totalOvers;
       let isTargetReached = false;
@@ -305,7 +363,9 @@ export function LiveScoring({
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             batsmanId: striker.id,
-            nonStrikerId: nonStriker.id,
+            nonStrikerId: isSingleBatMode
+              ? striker.id
+              : nonStriker?.id ?? striker.id,
             bowlerId: bowler.id,
             runs: payload.runs ?? 0,
             isWide: payload.isWide ?? false,
@@ -334,7 +394,6 @@ export function LiveScoring({
           updated[tempIndex] = {
             ...serverBall,
             id: serverBall.id || tempBallId,
-            wicketType: serverBall.wicketType ?? null,
           };
         }
         return updated;
@@ -382,24 +441,87 @@ export function LiveScoring({
     const prevStrikerId = strikerId;
     const prevNonStrikerId = nonStrikerId;
     const prevBowlerId = bowlerId;
-    const lastBall = prevBalls[prevBalls.length - 1];
-
-    if (!lastBall) {
-      return;
-    }
 
     try {
-      // Calculate undo immediately on client side (optimistic update)
-      const calculation = calculateUndoBallClient(balls, score);
+      // Calculate immediately on client side (optimistic update)
+      // Type assertion needed due to wicketType enum vs string difference
+      const calculation = calculateUndoBallClient(
+        balls as Parameters<typeof calculateUndoBallClient>[0],
+        score
+      );
+
+      if (!calculation.deletedBall) {
+        setError("No ball to undo");
+        return;
+      }
+
+      const lastBall = calculation.deletedBall;
 
       // Update state IMMEDIATELY (optimistic update)
-      setBalls(calculation.remainingBalls);
+      // Map remaining balls back to our local format, preserving IDs
+      // Use a Set to track used IDs to prevent duplicates
+      const usedIds = new Set<string>();
+      let tempIdCounter = 0;
+
+      const remainingBallsWithIds: Array<BallLike & { id: string }> =
+        calculation.remainingBalls.map((b) => {
+          // First, try to use the ID from the calculation result if it exists
+          if (b.id && !usedIds.has(b.id)) {
+            usedIds.add(b.id);
+            return {
+              ...b,
+              id: b.id,
+              wicketType:
+                (b.wicketType as string | null | undefined) ?? undefined,
+            } as BallLike & { id: string };
+          }
+
+          // Find the original ball to preserve its ID
+          const originalBall = prevBalls.find(
+            (orig) =>
+              orig.id &&
+              !usedIds.has(orig.id) &&
+              orig.overNumber === b.overNumber &&
+              orig.ballNumber === b.ballNumber &&
+              orig.batsmanId === b.batsmanId &&
+              orig.bowlerId === b.bowlerId
+          );
+
+          if (originalBall?.id) {
+            usedIds.add(originalBall.id);
+            return {
+              ...b,
+              id: originalBall.id,
+              wicketType:
+                (b.wicketType as string | null | undefined) ?? undefined,
+            } as BallLike & { id: string };
+          }
+
+          // Generate a unique temp ID as last resort
+          let ballId: string;
+          do {
+            tempIdCounter += 1;
+            ballId = `temp-${Date.now()}-${tempIdCounter}-${Math.random()}`;
+          } while (usedIds.has(ballId));
+
+          usedIds.add(ballId);
+          return {
+            ...b,
+            id: ballId,
+            wicketType:
+              (b.wicketType as string | null | undefined) ?? undefined,
+          } as BallLike & { id: string };
+        });
+      console.log(
+        `[DEBUG] LiveScoring undo: Setting ${remainingBallsWithIds.length} remaining balls, new score: ${calculation.updatedScore.totalRuns} runs, ${calculation.updatedScore.wickets} wickets`
+      );
+      setBalls(remainingBallsWithIds as BallLike[]);
       setScore(calculation.updatedScore);
 
       // Handle undo of strike rotation and over completion
       let newStrikerId = prevStrikerId;
       let newNonStrikerId = prevNonStrikerId;
-      let newBowlerId = prevBowlerId;
+      const newBowlerId = prevBowlerId;
 
       // Check if an over was undone (over completion was reversed)
       const overWasUndone =
@@ -408,12 +530,20 @@ export function LiveScoring({
           calculation.updatedScore.ballsInOver === 5 &&
           calculation.updatedScore.overs === prevScore.overs - 1);
 
+      // Check if the last ball was the 6th ball with odd runs
+      const was6thBallWithOddRuns =
+        lastBall.ballNumber === 6 &&
+        lastBall.runs % 2 === 1 &&
+        !lastBall.isWide &&
+        !lastBall.isNoBall;
+
       // If the deleted ball changed strike, undo the strike change
+      // But skip if it was the 6th ball with odd runs (we didn't swap for that)
       if (
         lastBall.strikerChanged &&
         prevStrikerId &&
         prevNonStrikerId &&
-        lastBall.ballNumber !== 6
+        !was6thBallWithOddRuns
       ) {
         // Swap back: if we swapped striker/non-striker, swap them back
         newStrikerId = prevNonStrikerId;
@@ -422,18 +552,15 @@ export function LiveScoring({
 
       // If an over was undone, undo the over completion strike swap
       if (overWasUndone && prevStrikerId && prevNonStrikerId) {
-        // Swap back the over completion swap
-        newStrikerId = prevNonStrikerId;
-        newNonStrikerId = prevStrikerId;
-        // Restore bowler if over was undone
-        // We need to find the bowler from the previous over
-        const previousOverBalls = prevBalls.filter(
-          (b) => b.overNumber === calculation.updatedScore.overs
-        );
-        if (previousOverBalls.length > 0) {
-          const lastBallOfPreviousOver =
-            previousOverBalls[previousOverBalls.length - 1];
-          newBowlerId = lastBallOfPreviousOver.bowlerId;
+        // Special case: If 6th ball had odd runs, we didn't swap on over completion
+        // (because the two rotations canceled out), so don't swap back
+        if (was6thBallWithOddRuns) {
+          // Don't swap - we didn't swap originally, so no need to swap back
+          // newStrikerId and newNonStrikerId remain unchanged
+        } else {
+          // Normal case: swap back the over completion swap
+          newStrikerId = prevNonStrikerId;
+          newNonStrikerId = prevStrikerId;
         }
       }
 
@@ -474,17 +601,7 @@ export function LiveScoring({
 
       const data = await res.json();
 
-      // Update with server response (in case of any discrepancies)
-      if (data.deletedBall) {
-        setBalls((prev) => {
-          const deletedId = data.deletedBall.id;
-          if (deletedId) {
-            return prev.filter((b) => b.id !== deletedId);
-          }
-          return prev.slice(0, -1);
-        });
-      }
-
+      // Update score with server response (in case of any discrepancies)
       setScore({
         totalRuns: data.innings.totalRuns,
         wickets: data.innings.wickets,
@@ -590,14 +707,10 @@ export function LiveScoring({
     ballsBowled: number;
     runsConceded: number;
     wickets: number;
-    maidens: number;
-    wides: number;
-    noBalls: number;
   };
 
   const batterStats = new Map<string, BatterAgg>();
   const bowlerStats = new Map<string, BowlerAgg>();
-  const bowlerOverRuns = new Map<string, Map<number, number>>();
 
   for (const b of balls) {
     const bat = battingPlayers.find(
@@ -634,56 +747,16 @@ export function LiveScoring({
           ballsBowled: 0,
           runsConceded: 0,
           wickets: 0,
-          maidens: 0,
-          wides: 0,
-          noBalls: 0,
         });
-        bowlerOverRuns.set(bowlPlayer.id, new Map());
       }
       const bs = bowlerStats.get(bowlPlayer.id)!;
-      const isLegal = !b.isWide && !b.isNoBall;
-      if (isLegal) bs.ballsBowled += 1;
-
+      if (!b.isWide && !b.isNoBall) bs.ballsBowled += 1;
       let runsThisBall = b.runs;
-      if (b.isWide) {
+      if (b.isWide || b.isNoBall) {
         runsThisBall += 1;
-        bs.wides += 1;
-      }
-      if (b.isNoBall) {
-        runsThisBall += 1;
-        bs.noBalls += 1;
       }
       bs.runsConceded += runsThisBall;
-
-      // Track wickets (only credit bowler for certain dismissal types)
-      if (b.isWicket) {
-        const bowlerGetsWicket =
-          b.wicketType === "BOWLED" ||
-          b.wicketType === "CAUGHT" ||
-          b.wicketType === "CAUGHT_AND_BOWLED" ||
-          b.wicketType === "STUMPED" ||
-          b.wicketType === "HIT_WICKET";
-        if (bowlerGetsWicket) {
-          bs.wickets += 1;
-        }
-      }
-
-      // Track runs per over for maidens
-      const overMap = bowlerOverRuns.get(bowlPlayer.id)!;
-      overMap.set(
-        b.overNumber,
-        (overMap.get(b.overNumber) ?? 0) + runsThisBall
-      );
-    }
-  }
-
-  // Calculate maidens
-  for (const [playerId, overMap] of bowlerOverRuns.entries()) {
-    const stats = bowlerStats.get(playerId);
-    if (stats) {
-      for (const runs of overMap.values()) {
-        if (runs === 0) stats.maidens += 1;
-      }
+      if (b.isWicket) bs.wickets += 1;
     }
   }
 
@@ -736,7 +809,7 @@ export function LiveScoring({
           </div>
 
           {/* Action Buttons */}
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
             <button
               type="button"
               onClick={() => setShowScorecard(!showScorecard)}
@@ -756,7 +829,11 @@ export function LiveScoring({
         </header>
 
         {/* Player Selection */}
-        <div className="grid gap-3 rounded-xl bg-white/10 p-4 backdrop-blur-sm md:grid-cols-3">
+        <div
+          className={`grid gap-3 rounded-xl bg-white/10 p-4 backdrop-blur-sm ${
+            isSingleBatMode ? "md:grid-cols-2" : "md:grid-cols-3"
+          }`}
+        >
           <div>
             <div className="mb-2 flex items-center gap-1 text-xs font-bold text-blue-100">
               <span>👤</span>
@@ -781,30 +858,32 @@ export function LiveScoring({
               ))}
             </select>
           </div>
-          <div>
-            <div className="mb-2 flex items-center gap-1 text-xs font-bold text-blue-100">
-              <span>👤</span>
-              <span>Non-Striker</span>
-            </div>
-            <select
-              className="w-full rounded-lg border-2 border-white/20 bg-white/20 px-3 py-2 text-sm font-semibold text-white outline-none backdrop-blur-sm transition-all focus:border-white/40 focus:bg-white/30"
-              value={nonStrikerId ?? ""}
-              onChange={(e) => setNonStrikerId(e.target.value || undefined)}
-            >
-              <option value="" className="bg-slate-800 text-white">
-                Select non-striker
-              </option>
-              {battingPlayers.map((p) => (
-                <option
-                  key={p.id}
-                  value={p.id}
-                  className="bg-slate-800 text-white"
-                >
-                  {p.name}
+          {!isSingleBatMode && (
+            <div>
+              <div className="mb-2 flex items-center gap-1 text-xs font-bold text-blue-100">
+                <span>👤</span>
+                <span>Non-Striker</span>
+              </div>
+              <select
+                className="w-full rounded-lg border-2 border-white/20 bg-white/20 px-3 py-2 text-sm font-semibold text-white outline-none backdrop-blur-sm transition-all focus:border-white/40 focus:bg-white/30"
+                value={nonStrikerId ?? ""}
+                onChange={(e) => setNonStrikerId(e.target.value || undefined)}
+              >
+                <option value="" className="bg-slate-800 text-white">
+                  Select non-striker
                 </option>
-              ))}
-            </select>
-          </div>
+                {battingPlayers.map((p) => (
+                  <option
+                    key={p.id}
+                    value={p.id}
+                    className="bg-slate-800 text-white"
+                  >
+                    {p.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
           <div>
             <div className="mb-2 flex items-center gap-1 text-xs font-bold text-blue-100">
               <span>🎾</span>
@@ -847,29 +926,16 @@ export function LiveScoring({
         />
 
         {/* Status Messages */}
-        {syncing && !syncError && (
-          <div className="flex items-center justify-center gap-2 rounded-xl bg-blue-50 p-3 border-2 border-blue-200">
-            <div className="h-4 w-4 animate-spin rounded-full border-2 border-blue-600 border-t-transparent"></div>
-            <p className="text-sm font-semibold text-blue-700">
+        {syncing && (
+          <div className="flex items-center justify-center gap-2 rounded-xl bg-amber-50 p-3 border-2 border-amber-200">
+            <div className="h-4 w-4 animate-spin rounded-full border-2 border-amber-600 border-t-transparent"></div>
+            <p className="text-sm font-semibold text-amber-700">
               Syncing to database...
             </p>
           </div>
         )}
-        {syncError && (
-          <div className="flex items-center gap-2 rounded-xl bg-red-50 p-3 border-2 border-red-200">
-            <span className="text-lg">⚠️</span>
-            <div className="flex-1">
-              <p className="text-sm font-semibold text-red-700">
-                Sync error: {syncError}
-              </p>
-              <p className="text-xs text-red-600 mt-1">
-                Changes are saved locally. Please refresh the page.
-              </p>
-            </div>
-          </div>
-        )}
-        {error && !syncError && (
-          <div className="flex items-center gap-2 rounded-xl bg-red-50 p-3 border-2 border-red-200">
+        {error && (
+          <div className="flex items-center gap-2 rounded-xl bg-red-50 p-3">
             <span className="text-lg">⚠️</span>
             <p className="text-sm font-semibold text-red-700">{error}</p>
           </div>
@@ -915,10 +981,10 @@ export function LiveScoring({
           nonStriker={nonStrikerStats}
           bowler={bowlerStatsEntry}
         />
-        {/* @ts-expect-error - PreviousBallsDisplay expects BallLike with required id, but we ensure all balls have IDs */}
-        <PreviousBallsDisplay balls={balls} />
-        {/* @ts-expect-error - OverTimeline expects BallLike with required id, but we ensure all balls have IDs */}
-        <OverTimeline balls={balls} />
+        <PreviousBallsDisplay
+          balls={balls as Array<BallLike & { id: string }>}
+        />
+        <OverTimeline balls={balls as Array<BallLike & { id: string }>} />
       </div>
 
       {/* Sliding Scorecard Section */}
@@ -927,57 +993,85 @@ export function LiveScoring({
           showScorecard ? "translate-x-0" : "translate-x-full"
         }`}
       >
-        <div className="sticky top-0 z-10 flex items-center justify-between border-b border-zinc-200 bg-white px-4 py-3 shadow-sm">
-          <h2 className="text-lg font-bold text-zinc-900">Scorecard</h2>
-          <button
-            type="button"
-            onClick={() => setShowScorecard(false)}
-            className="rounded-md p-2 text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900"
-            aria-label="Close scorecard"
-          >
-            <svg
-              className="h-5 w-5"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
+        <div className="sticky top-0 z-10 border-b border-zinc-200 bg-white shadow-sm">
+          <div className="flex items-center justify-between px-4 py-3">
+            <h2 className="text-lg font-bold text-zinc-900">Scorecard</h2>
+            <button
+              type="button"
+              onClick={() => setShowScorecard(false)}
+              className="rounded-md p-2 text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900"
+              aria-label="Close scorecard"
             >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={2}
-                d="M6 18L18 6M6 6l12 12"
-              />
-            </svg>
-          </button>
+              <svg
+                className="h-5 w-5"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M6 18L18 6M6 6l12 12"
+                />
+              </svg>
+            </button>
+          </div>
+          {/* Innings Toggle (only show in 2nd innings) */}
+          {firstInningsData && inningsNumber === 2 && (
+            <div className="flex border-t border-zinc-200">
+              <button
+                type="button"
+                onClick={() => setShowFirstInnings(false)}
+                className={`flex-1 px-4 py-2 text-sm font-semibold transition-colors ${
+                  !showFirstInnings
+                    ? "bg-blue-50 text-blue-700 border-b-2 border-blue-600"
+                    : "text-zinc-600 hover:bg-zinc-50"
+                }`}
+              >
+                2nd Innings
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowFirstInnings(true)}
+                className={`flex-1 px-4 py-2 text-sm font-semibold transition-colors ${
+                  showFirstInnings
+                    ? "bg-blue-50 text-blue-700 border-b-2 border-blue-600"
+                    : "text-zinc-600 hover:bg-zinc-50"
+                }`}
+              >
+                1st Innings
+              </button>
+            </div>
+          )}
         </div>
         <div className="p-4">
-          <MatchScorecard
-            battingTeamName={battingTeamName}
-            bowlingTeamName={bowlingTeamName}
-            score={score}
-            totalOvers={totalOvers}
-            targetRuns={targetRuns}
-            inningsNumber={inningsNumber}
-            striker={strikerStats}
-            nonStriker={nonStrikerStats}
-            bowler={bowlerStatsEntry}
-            balls={balls.map((b) => ({
-              id: b.id || `temp-${b.overNumber}-${b.ballNumber}`,
-              overNumber: b.overNumber,
-              ballNumber: b.ballNumber,
-              runs: b.runs,
-              isWide: b.isWide,
-              isNoBall: b.isNoBall,
-              isWicket: b.isWicket,
-              batsmanId: b.batsmanId,
-              bowlerId: b.bowlerId,
-              strikerChanged: b.strikerChanged,
-              wicketType: (b.wicketType as string) ?? undefined,
-              fielderId: b.fielderId,
-              dismissedBatsmanId: b.dismissedBatsmanId,
-            }))}
-            players={players}
-          />
+          {firstInningsData && inningsNumber === 2 && showFirstInnings ? (
+            <InningsScorecard
+              inningsNumber={firstInningsData.inningsNumber}
+              battingTeamName={firstInningsData.battingTeamName}
+              bowlingTeamName={firstInningsData.bowlingTeamName}
+              score={firstInningsData.score}
+              totalOvers={totalOvers}
+              balls={firstInningsData.balls as Array<BallLike & { id: string }>}
+              players={players}
+              isCompleted={firstInningsData.isCompleted}
+            />
+          ) : (
+            <MatchScorecard
+              battingTeamName={battingTeamName}
+              bowlingTeamName={bowlingTeamName}
+              score={score}
+              totalOvers={totalOvers}
+              targetRuns={targetRuns}
+              inningsNumber={inningsNumber}
+              striker={strikerStats}
+              nonStriker={nonStrikerStats}
+              bowler={bowlerStatsEntry}
+              balls={balls as Parameters<typeof MatchScorecard>[0]["balls"]}
+              players={players}
+            />
+          )}
         </div>
       </div>
 

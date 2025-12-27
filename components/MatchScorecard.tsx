@@ -149,7 +149,8 @@ function getExtras(balls: BallLike[]): {
       illegalStreak = 0;
     }
 
-    // Bonus run for 2 consecutive illegal balls
+    // Bonus run is awarded on the 2nd, 3rd, 4th, etc. consecutive illegal delivery
+    // After the first illegal, every subsequent illegal in the streak gets 1 bonus run
     if (illegalStreak >= 2) {
       bonus++;
     }
@@ -287,11 +288,19 @@ export function MatchScorecard({
   );
   const requiredRunRate =
     targetRuns !== null && score.overs < totalOvers
-      ? calculateRunRate(
-          targetRuns - score.totalRuns,
-          totalOvers - score.overs,
-          score.ballsInOver === 0 ? 6 : 6 - score.ballsInOver
-        )
+      ? (() => {
+          const runsNeeded = targetRuns - score.totalRuns;
+          // Calculate total remaining balls
+          // Total balls available = totalOvers * 6
+          // Balls bowled = score.overs * 6 + score.ballsInOver
+          // Remaining balls = total balls - balls bowled
+          const totalBallsAvailable = totalOvers * 6;
+          const ballsBowled = score.overs * 6 + score.ballsInOver;
+          const totalRemainingBalls = totalBallsAvailable - ballsBowled;
+          
+          if (totalRemainingBalls <= 0) return 0;
+          return (runsNeeded / totalRemainingBalls) * 6;
+        })()
       : null;
 
   const partnership = calculatePartnership(striker, nonStriker, balls);

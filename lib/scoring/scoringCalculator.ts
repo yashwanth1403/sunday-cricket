@@ -58,10 +58,31 @@ export interface RecordBallCalculationResult {
 export function calculateRecordBall(
   input: RecordBallCalculationInput
 ): RecordBallCalculationResult {
-  const { existingBalls, innings, batsmanId, nonStrikerId, bowlerId, runs, isWide, isNoBall, isWicket, wicketType, fielderId, dismissedBatsmanId } = input;
+  const {
+    existingBalls,
+    innings,
+    batsmanId,
+    nonStrikerId,
+    bowlerId,
+    runs,
+    isWide,
+    isNoBall,
+    isWicket,
+    wicketType,
+    fielderId,
+    dismissedBatsmanId,
+  } = input;
+
+  // Ensure balls are sorted by overNumber and ballNumber for correct streak calculation
+  const sortedBalls = [...existingBalls].sort((a, b) => {
+    if (a.overNumber !== b.overNumber) {
+      return a.overNumber - b.overNumber;
+    }
+    return a.ballNumber - b.ballNumber;
+  });
 
   const illegalStreakBefore = getIllegalStreak(
-    existingBalls.map((b) => ({ isWide: b.isWide, isNoBall: b.isNoBall }))
+    sortedBalls.map((b) => ({ isWide: b.isWide, isNoBall: b.isNoBall }))
   );
   const isLegal = !isWide && !isNoBall;
 
@@ -81,9 +102,13 @@ export function calculateRecordBall(
     isNoBall: isNoBall,
   });
 
-  const newIllegalStreak =
-    illegalStreakBefore + (isWide || isNoBall ? 1 : 0);
-  const bonusIllegalRun = extraRunForIllegalPair(newIllegalStreak);
+  const isNewBallIllegal = isWide || isNoBall;
+  const newIllegalStreak = illegalStreakBefore + (isNewBallIllegal ? 1 : 0);
+  // Only award bonus if the new ball is illegal (streak continues)
+  // If the new ball is legal, the streak is broken and no bonus is awarded
+  const bonusIllegalRun = isNewBallIllegal
+    ? extraRunForIllegalPair(newIllegalStreak)
+    : 0;
 
   // Determine which batsman was dismissed
   let dismissedBatsmanIdResult: string | null = null;
@@ -115,7 +140,7 @@ export function calculateRecordBall(
   };
 
   const allBalls = [...existingBalls, newBall];
-  
+
   // Convert BallLike to Ball format for calculateStats
   const ballsForStats: Ball[] = allBalls.map((b, idx) => ({
     id: b.id || `temp-${idx}`,
@@ -192,14 +217,22 @@ export function calculateUndoBall(
   }
 
   // Find the last ball (highest overNumber, then highest ballNumber)
-  const sortedBalls = [...existingBalls].sort((a, b) => {
-    if (a.overNumber !== b.overNumber) {
-      return b.overNumber - a.overNumber;
-    }
-    return b.ballNumber - a.ballNumber;
-  });
+  // For balls with same over/ball number, use array index as tiebreaker (last added = last in array)
+  const sortedBalls = [...existingBalls]
+    .map((b, idx) => ({ ball: b, originalIndex: idx }))
+    .sort((a, b) => {
+      if (a.ball.overNumber !== b.ball.overNumber) {
+        return b.ball.overNumber - a.ball.overNumber;
+      }
+      if (a.ball.ballNumber !== b.ball.ballNumber) {
+        return b.ball.ballNumber - a.ball.ballNumber;
+      }
+      // If same over and ball number (e.g., multiple wides), use original index
+      // Last added ball (higher index) should be removed first
+      return b.originalIndex - a.originalIndex;
+    });
 
-  const lastBall = sortedBalls[0];
+  const lastBall = sortedBalls[0].ball;
   const remainingBalls = existingBalls.filter((b) => {
     if (b.id) {
       return b.id !== lastBall.id;
@@ -260,4 +293,3 @@ export function calculateUndoBall(
     deletedBall: lastBall,
   };
 }
-
